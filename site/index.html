@@ -393,6 +393,7 @@
         <p class="q" data-qid="T3">How much did the buses lose in 2025?</p>
         <p class="raw ok"><span>✅ Raw Genie got it right</span> −$66.5M, matching both bus agencies by mode.</p>
         <p><span class="kind def">Agency definition</span> "The buses" = NYC Transit Bus <em>and</em> MTA Bus Company. Check whether both made it into the SQL, and how they were matched (by ID or by a fuzzy <code>ILIKE '%bus%'</code>).</p>
+        <details><summary>Expected answer</summary><p>A combined operating deficit of <strong data-ans="tr_buses_2025">…</strong>. Counting only NYC Transit Bus misses MTA Bus Company.</p></details>
       </div>
       <div class="trapcard mech">
         <p class="q" data-qid="T4">What was the MTA's farebox recovery ratio in 2025?</p>

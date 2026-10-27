@@ -47,6 +47,9 @@ ans["tr_fbr_naive"] = f"{float(nv):.3f} ({100*float(nv):.1f}%)"
 nm, r = q(f"""SELECT a.agency_name, SUM(f.fare_revenue_m) / SUM(f.total_expense_m) r FROM {T}.monthly_financials f
   JOIN {T}.transit_agencies a USING (agency_id) WHERE f.agency_id <> 'SIF' GROUP BY 1 ORDER BY r ASC LIMIT 1""")
 ans["tr_fbr_worst"] = f"{nm} ({100*float(r):.1f}%, all months)"
+tot, bus, mtab = q(f"""SELECT SUM(operating_balance_m), SUM(operating_balance_m) FILTER (WHERE agency_id = 'NYCT-BUS'),
+  SUM(operating_balance_m) FILTER (WHERE agency_id = 'MTABC') FROM {T}.monthly_financials WHERE calendar_year = 2025 AND agency_id IN ('NYCT-BUS', 'MTABC')""")
+ans["tr_buses_2025"] = f"-${abs(float(tot)):,.1f} million (NYC Transit Bus -${abs(float(bus)):,.1f}M + MTA Bus Company -${abs(float(mtab)):,.1f}M)"
 ans["tr_cbd_net"] = f"${float(q(f'SELECT SUM(net_revenue_m) FROM {T}.cbd_toll_program')[0]):,.1f} million"
 ans["tr_sub_rev"] = f"{float(q(f'''SELECT SUM(total_revenue_m) FROM {T}.monthly_financials WHERE agency_id = 'NYCT-SUB' AND calendar_year = 2025''')[0]):,.0f}"
 
