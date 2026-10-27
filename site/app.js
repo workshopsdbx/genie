@@ -164,8 +164,12 @@
     const text = q.childNodes[0].textContent.trim();
     const tr = document.createElement("tr");
     tr.innerHTML = `<td><span class="qid-chip">${esc(q.dataset.qid || "")}</span> ${esc(text)}</td>`;
+    addScoreCells(tr, i);
+    tbody.appendChild(tr);
+  });
+  function addScoreCells(tr, key) {
     ["raw", "curated"].forEach((col) => {
-      const k = `${i}:${col}`; const td = document.createElement("td"); td.className = "cell";
+      const k = `${key}:${col}`; const td = document.createElement("td"); td.className = "cell";
       td.textContent = score[k] || "";
       td.addEventListener("click", () => {
         const next = marks[(marks.indexOf(td.textContent) + 1) % marks.length];
@@ -173,8 +177,7 @@
       });
       tr.appendChild(td);
     });
-    tbody.appendChild(tr);
-  });
+  }
 
   /* ---------- BYOQ worksheet ---------- */
   // Built to be taken back to the agency: each card is a candidate question for a real Genie pilot.
@@ -228,7 +231,9 @@
           OPTIONS[key].forEach((o) => { const op = document.createElement("option"); op.value = o; op.textContent = o || "Choose…"; el.appendChild(op); });
         } else el = document.createElement(kind);
         el.id = id; el.value = it[key] || "";
-        el.addEventListener(kind === "select" ? "change" : "input", () => { items[idx][key] = el.value; store.set("byoq", items); });
+        const save = () => { items[idx][key] = el.value; store.set("byoq", items); };
+        el.addEventListener("input", save);
+        el.addEventListener("change", save);
         box.appendChild(el); row.appendChild(box);
       });
       card.appendChild(row);
@@ -237,7 +242,23 @@
     });
   }
   renderByoq();
-  $("#byoq-add").addEventListener("click", () => { items.push({}); store.set("byoq", items); renderByoq(); });
+  $("#byoq-add").addEventListener("click", () => { items.push({}); store.set("byoq", items); renderByoq(); renderOwnScore(); });
+
+  // Your own questions also get scorecard rows, so Rounds 1 and 2 track them alongside the traps.
+  function renderOwnScore() {
+    $$("tr.own", tbody).forEach((r) => r.remove());
+    items.forEach((it, idx) => {
+      const q = (it.question || "").trim();
+      if (!q) return;
+      const tr = document.createElement("tr"); tr.className = "own";
+      tr.innerHTML = `<td><span class="qid-chip own">You</span> ${esc(q.length > 110 ? q.slice(0, 110) + "…" : q)}</td>`;
+      addScoreCells(tr, `own:${q}`);
+      tbody.appendChild(tr);
+    });
+  }
+  renderOwnScore();
+  list.addEventListener("change", renderOwnScore);
+  list.addEventListener("click", (e) => { if (e.target.closest(".rm")) renderOwnScore(); });
 
   // Exports: only cards with a question; High priority first.
   const RANK = { High: 0, Medium: 1, Low: 2 };

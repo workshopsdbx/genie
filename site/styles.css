@@ -285,3 +285,8 @@ table.agenda td:nth-child(2) { white-space: normal; width: 34%; }
 .big-steps li { counter-increment: bs; position: relative; background: var(--white); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 18px 14px 64px; margin: 10px 0; }
 .big-steps li::before { content: counter(bs, decimal-leading-zero); position: absolute; left: 18px; top: 14px; font-family: "DM Mono", monospace; font-weight: 500; color: var(--lava); font-size: 18px; }
 .big-steps li > strong:first-child { display: block; margin-bottom: 2px; }
+
+/* BYOQ threads */
+.qid-chip.own { background: var(--lava); }
+.your-turn { background: var(--white); border: 1px solid var(--line); border-left: 4px solid var(--lava); border-radius: var(--radius); padding: 4px 18px 8px; margin: 22px 0; }
+.your-turn h3 { margin-top: 14px; }
