@@ -7,7 +7,8 @@ Attendees each use their own **Databricks Free Edition** workspace: import the n
 
 | Path | What it is |
 |---|---|
-| `genie_byoq_nyc_workshop.py` | Databricks notebook (SOURCE format). Builds 4 schemas / 29 synthetic tables + 4 metric views, creates or updates Starter + Curated Genie spaces per domain, optional grants, and self-tests the answer key. |
+| `genie_nyc_aging.py`, `genie_nyc_transit.py`, `genie_nyc_water.py`, `genie_nyc_dohmh.py` | **What attendees run:** one notebook per dataset (~3 min on Free Edition). **Generated** from the all-in-one by `build_domain_notebooks.py`. |
+| `genie_byoq_nyc_workshop.py` | All-in-one source notebook (all four datasets; facilitator demo). Databricks notebook (SOURCE format). Builds 4 schemas / 29 synthetic tables + 4 metric views, creates or updates Starter + Curated Genie spaces per domain, optional grants, and self-tests the answer key. |
 | `genie_byoq_nyc_curated_spaces.py` | Notebook 2 (optional). Creates the four Curated answer-key Genie spaces for attendees who get stuck or want to skip ahead. **Generated** from notebook 1 by `build_curated_notebook.py`: re-run that after editing the answer key. |
 | `site/` | Static workshop site (`index.html` + `styles.css` + `app.js`). Open `index.html` directly or host it anywhere. |
 | `site/config.js` | Default catalog shown in the guide (`workspace`). Attendees can override it on the page. |
@@ -23,4 +24,6 @@ Domains: `nyc_aging_home_care` (NYC Aging / HRA / MLTC), `nyc_transit_finance` (
 Notebook widgets: `catalog` and `warehouse_id` (blank = auto-detect), `genie_spaces` (curated default / both / starter / none), `share_with_group` (paid workspaces),
 `metadata_level` (basic = Lab 3 traps fire; rich = UC comments include usage rules, for the "metadata alone" demo).
 
-If you change the notebook answer key: re-run the notebook, then `compute_answers.py`, then `build_site_content.py`, and copy the notebook into `site/`.
+If you change the all-in-one notebook: run `build_domain_notebooks.py` and `build_curated_notebook.py`, re-run the notebook, then `compute_answers.py` and `build_site_content.py`, and copy the `.py` notebooks into `site/`.
+
+Feedback form: https://docs.google.com/forms/d/e/1FAIpQLSdiCpmoeixrQxdm2DWbAYy2utduESC6DTTvRl7pGbf2578_gA/viewform (QR code: `site/feedback-qr.svg`).

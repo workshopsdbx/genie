@@ -24,11 +24,11 @@ out = f'''# Databricks notebook source
 # MAGIC %md
 # MAGIC # Genie BYOQ Workshop — Notebook 2: Curated answer-key spaces
 # MAGIC
-# MAGIC **Run this only if you're stuck or want to skip ahead.** It creates four finished **"… (Curated)"** Genie spaces,
-# MAGIC one per domain, with everything from Lab 4: text instructions, example SQL, joins, SQL measures, the metric view,
+# MAGIC **Run this only if you're stuck or want to skip ahead.** It creates a finished **"… (Curated)"** Genie space
+# MAGIC for each domain you've loaded, with everything from Lab 4: text instructions, example SQL, joins, SQL measures, the metric view,
 # MAGIC and a benchmark set. Open yours from the Genie list and compare it with the space you built.
 # MAGIC
-# MAGIC **Run `genie_byoq_nyc_workshop` (notebook 1) first.** This notebook only adds Genie spaces: it doesn't create data.
+# MAGIC **Run your domain notebook first** (`genie_nyc_aging`, `genie_nyc_transit`, `genie_nyc_water` or `genie_nyc_dohmh`). This notebook only adds Genie spaces: it doesn't create data.
 # MAGIC
 # MAGIC **How to run:** connect to **Serverless**, then **Run all** (about a minute). Leave the widgets blank.
 # MAGIC Re-running is safe: spaces are updated in place, and the space you built yourself isn't touched.
@@ -59,13 +59,12 @@ print(f"Catalog : {{CATALOG}}")
 
 {SEP}
 
-NEEDED = [f"{{CATALOG}}.{{s}}.{{t}}" for s, t in [
-    (SCHEMA_AGING, "client_metrics"), (SCHEMA_TRANSIT, "transit_operating_metrics"),
-    (SCHEMA_WATER, "water_billing_metrics"), (SCHEMA_HEALTH, "inspection_metrics")]]
-missing = [t for t in NEEDED if not spark.catalog.tableExists(t)]
-if missing:
-    raise RuntimeError("Run the genie_byoq_nyc_workshop notebook first. Missing: " + ", ".join(missing))
-print("Workshop data and metric views found.")
+MV_BY_DOMAIN = {{"aging": (SCHEMA_AGING, "client_metrics"), "transit": (SCHEMA_TRANSIT, "transit_operating_metrics"),
+                "water": (SCHEMA_WATER, "water_billing_metrics"), "health": (SCHEMA_HEALTH, "inspection_metrics")}}
+AVAILABLE = [d for d, (sch, mv) in MV_BY_DOMAIN.items() if spark.catalog.tableExists(f"{{CATALOG}}.{{sch}}.{{mv}}")]
+if not AVAILABLE:
+    raise RuntimeError("No workshop data found. Run your domain notebook (genie_nyc_aging / _transit / _water / _dohmh) first.")
+print("Building Curated spaces for:", ", ".join(AVAILABLE))
 
 {SEP}
 
@@ -74,6 +73,8 @@ print("Workshop data and metric views found.")
 {SEP}
 
 {answer_key}
+DOMAINS = {{k: v for k, v in DOMAINS.items() if k in AVAILABLE}}
+
 {SEP}
 
 {helpers}

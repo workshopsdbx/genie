@@ -14,8 +14,11 @@
 
 <header class="topbar">
   <a class="brand" href="#welcome" style="text-decoration:none"><img src="databricks-logo.svg" alt="Databricks"><span class="divider"></span><span class="title">NYC Databricks Day</span><span class="pill">Hands-On Genie Workshop</span></a>
+  <div class="top-actions">
+  <button class="btn ghost sm" id="print-btn" type="button" title="Print this guide or save it as a PDF">Print / PDF</button>
   <div class="progress-wrap" title="Your progress is saved in this browser">
     <div class="progress"><div id="progress-bar"></div></div><span id="progress-label">0%</span>
+  </div>
   </div>
 </header>
 
@@ -57,6 +60,7 @@
     <a href="#lab5"><span class="bullet sm b-orange">5</span>Benchmark</a>
     <a href="#lab6"><span class="bullet sm b-purple">6</span>Bring your own question</a>
     <a href="#lab7"><span class="bullet sm b-gray">7</span>Wrap-up &amp; next steps</a>
+    <a href="#feedback"><span class="stop"></span>Feedback</a>
     <a href="#cheatsheet"><span class="stop"></span>Cheat sheet</a>
     <a href="#troubleshooting"><span class="stop"></span>Troubleshooting &amp; FAQ</a>
     <a href="#facilitator"><span class="stop"></span>Facilitator guide</a>
@@ -85,7 +89,7 @@
         <a href="#lab4">more curation &amp; metric views</a> ·
         <span class="bullet sm b-orange">5</span> <a href="#lab5">Benchmark</a> ·
         <span class="bullet sm b-purple">6</span> <a href="#lab6">Bring your own question</a></td></tr>
-      <tr><td class="slot">12:15 – 12:30</td><td>Wrap-Up &amp; Next Steps</td><td><span class="bullet sm b-gray">7</span> <a href="#lab7">Keep your sandbox, share &amp; take it to production</a></td></tr>
+      <tr><td class="slot">12:15 – 12:30</td><td>Wrap-Up &amp; Next Steps</td><td><span class="bullet sm b-gray">7</span> <a href="#lab7">Keep your sandbox, share &amp; take it to production</a> · <a href="#feedback">Feedback form</a></td></tr>
     </tbody>
   </table>
   <p class="muted small">Coaches from Databricks and Slalom are in the room for every step. Raise your hand any time.</p>
@@ -95,18 +99,26 @@
 <section id="setup">
   <h2>Set up your Free Edition workspace <span class="when">8:30 – 9:00 or the 10:00 break</span></h2>
   <p>Everyone works in their <strong>own</strong> free Databricks workspace, so nothing you do affects anyone else, and it's yours to keep after the event.
-  Setup is about 5 minutes of clicking plus 5–10 minutes for the notebook to build the data, so <strong>start it before the 10:15 lab</strong>.</p>
+  Setup is about 5 minutes of clicking plus about 3 minutes for the notebook to build the data, so <strong>start it before the 10:15 lab</strong>.</p>
   <ol class="steps" data-group="setup">
     <li><label><input type="checkbox" data-id="s1"> <strong>Sign up or log in</strong> at <a href="https://www.databricks.com/learn/free-edition" target="_blank" rel="noopener">databricks.com/learn/free-edition</a>
       (email code, Google, or Microsoft). Your workspace opens in the browser.</label></li>
-    <li><label><input type="checkbox" data-id="s2"> <strong>Download notebook 1:</strong> <a href="genie_byoq_nyc_workshop.py" download><code>genie_byoq_nyc_workshop.py</code></a>. This is the only one you need to run.
-      <span class="muted small">Optional, for later: notebook 2, <a href="genie_byoq_nyc_curated_spaces.py" download><code>genie_byoq_nyc_curated_spaces.py</code></a>, builds the finished answer-key spaces if you get stuck. Import it now too so it's ready.</span></label></li>
+    <li><label><input type="checkbox" data-id="s2"> <strong>Pick your dataset</strong> below, then <strong>download its notebook</strong>. Each notebook builds just one dataset, so it runs in about 3 minutes.
+      Neighbors should pick different ones so you can compare later.</label>
+      <div class="domain-picker" id="domain-picker">
+        <button type="button" data-pick="aging" data-nb="genie_nyc_aging.py" data-schema="nyc_aging_home_care"><strong>NYC Aging &amp; Home Care</strong><span>HRA · NYC Aging · DOHMH</span></button>
+        <button type="button" data-pick="transit" data-nb="genie_nyc_transit.py" data-schema="nyc_transit_finance"><strong>NYC Transit Finance</strong><span>OMB · MTA · DOT</span></button>
+        <button type="button" data-pick="water" data-nb="genie_nyc_water.py" data-schema="nyc_dep_water"><strong>NYC DEP Water &amp; Sewer</strong><span>DEP · Water Board · DOF</span></button>
+        <button type="button" data-pick="health" data-nb="genie_nyc_dohmh.py" data-schema="nyc_dohmh_food_safety"><strong>NYC DOHMH Food Safety &amp; Rodents</strong><span>DOHMH · Environmental Health</span></button>
+      </div>
+      <p class="nb-download" id="nb-download">Pick a dataset to see its notebook.</p>
+      <p class="muted small">Optional, for later: <a href="genie_byoq_nyc_curated_spaces.py" download><code>genie_byoq_nyc_curated_spaces.py</code></a> builds the finished answer-key space if you get stuck. Import it now too so it's ready.</p></li>
     <li><label><input type="checkbox" data-id="s3"> In the workspace sidebar click <strong>Workspace</strong>, open your home folder, then use the <strong>⋮</strong> menu (or right-click) → <strong>Import</strong>.
-      Drop in the file you downloaded. <span class="muted small">Or choose <strong>URL</strong> and paste: <code id="nb-url">…</code></span></label></li>
-    <li><label><input type="checkbox" data-id="s4"> Open <strong>notebook 1</strong>. Top right, click <strong>Connect</strong> → <strong>Serverless</strong>. Then click <strong>Run all</strong> (about 8–10 minutes).
+      Drop in the file you downloaded. <span class="muted small">Or choose <strong>URL</strong> and paste: <code id="nb-url">pick a dataset first</code></span></label></li>
+    <li><label><input type="checkbox" data-id="s4"> Open <strong>your dataset's notebook</strong>. Top right, click <strong>Connect</strong> → <strong>Serverless</strong>. Then click <strong>Run all</strong> (about 3 minutes).
       Leave the widgets at the top blank: it finds your catalog and SQL warehouse on its own.</label></li>
     <li><label><input type="checkbox" data-id="s5"> While it runs, read <a href="#data">Meet the data</a>. You're done when the last cells print ✓ lines and a table list.</label></li>
-    <li><label><input type="checkbox" data-id="s6"> Check: in <strong>Catalog</strong>, under your catalog, you can see <code>nyc_aging_home_care</code>, <code>nyc_transit_finance</code>, <code>nyc_dep_water</code> and <code>nyc_dohmh_food_safety</code>.</label></li>
+    <li><label><input type="checkbox" data-id="s6"> Check: in <strong>Catalog</strong>, under your catalog, you can see your dataset's schema: <code class="my-schema">nyc_…</code>.</label></li>
   </ol>
   <div class="catalog-box">
     <label for="catalog-input">Your catalog name</label>
@@ -114,9 +126,9 @@
     <p class="muted small">The notebook prints this as <code>Catalog : …</code> in its first cell (Free Edition's is usually <code>workspace</code>).
     Every SQL snippet on this page uses it.</p>
   </div>
-  <div class="callout info"><strong>What notebook 1 builds:</strong> 4 schemas with 29 tables of synthetic NYC data, one <strong>metric view</strong> per domain,
-  and a ready-made <strong>"… (Starter)"</strong> Genie space per domain (your fallback if you fall behind in Lab 1). You'll curate your <em>own</em> space in the labs.
-  <strong>Notebook 2</strong> adds the finished <strong>"… (Curated)"</strong> answer-key spaces, so run it only when you're stuck or want to compare.
+  <div class="callout info"><strong>What your notebook builds:</strong> one schema of synthetic NYC data (6–9 tables with descriptions Genie can read), a <strong>metric view</strong>,
+  and a ready-made <strong>"… (Starter)"</strong> Genie space (your fallback if you fall behind in Lab 1). You'll curate your <em>own</em> space in the labs.
+  <strong>Notebook 2</strong> (<code>genie_byoq_nyc_curated_spaces</code>) adds the finished <strong>"… (Curated)"</strong> answer-key space, so run it only when you're stuck or want to compare.
   It then runs every answer-key query as a self-test.</div>
   <div class="callout tip"><strong>Free Edition has a daily compute quota.</strong> One run of the notebook is all you need, so avoid re-running it over and over.
   If you hit the quota, compute pauses until the next day, but nothing you've built is deleted.</div>
@@ -211,7 +223,7 @@
   <h2><span class="bullet b-red">1</span> Build your Genie space</h2>
   <p class="goal"><strong>Goal:</strong> create your own Genie space from scratch, the same way you would over your agency's data. You'll curate it in Labs 3–5. <span class="time">10:15 · 15 min</span></p>
   <ol class="steps" data-group="lab1">
-    <li><label><input type="checkbox" data-id="l1a"> <strong>Pick one domain</strong> for the rest of the day. Neighbors should pick different ones so you can compare later.</label></li>
+    <li><label><input type="checkbox" data-id="l1a"> Work in <strong>the dataset you loaded in setup</strong> for the rest of the day. The tabs on this page already show it.</label></li>
     <li><label><input type="checkbox" data-id="l1b"> In the left sidebar click <strong>Genie Agents</strong> (in some workspaces it's labeled <strong>Genie</strong>), then <strong>New</strong> in the upper-right corner.</label></li>
     <li><label><input type="checkbox" data-id="l1c"> <strong>Choose data sources:</strong> browse to <code><span class="cfg" data-cfg="catalog">workspace</span></code> → your domain's schema and tick the tables listed below. <strong>Skip the metric view</strong> for now (it has a different icon). You'll add it in Lab 4. Click <strong>Create</strong>.</label></li>
     <li><label><input type="checkbox" data-id="l1d"> <strong>Genie Code</strong> may open and offer table descriptions and example queries. <strong>Close it or reject the suggestions for now.</strong> You want to see how an uncurated space behaves first. You can come back to Genie Code in Lab 4.</label></li>
@@ -464,7 +476,7 @@
   so a ratio stays correct at any grain.</div>
 
   <div class="callout tip"><strong>Stuck, or want to see the finished version?</strong> Open <strong>notebook 2</strong> (<code>genie_byoq_nyc_curated_spaces</code>) and click <strong>Run all</strong>.
-  In about a minute you'll have a <strong>"… (Curated)"</strong> space for every domain with everything below already in it. Your own space isn't touched.</div>
+  In about a minute you'll have a <strong>"… (Curated)"</strong> space for your dataset with everything below already in it. Your own space isn't touched.</div>
   <p class="phase"><span>Go deeper · Open lab</span> 11:30 onward. Do as many as you like.</p>
   <ol class="steps" data-group="lab4b">
     <li><label><input type="checkbox" data-id="l4b"> Add <strong>joins</strong> for your domain (Configure → Examples → Add → Joins).</label></li>
@@ -593,6 +605,19 @@
   </div>
 </section>
 
+<!-- ============================================================ FEEDBACK -->
+<section id="feedback">
+  <h2>Tell us how it went</h2>
+  <div class="feedback-box">
+    <div>
+      <p class="lead">Two minutes, and only the first question is required. Your answers shape the next session.
+      If you'd like help piloting Genie on your agency's own data, say so at the end and we'll follow up.</p>
+      <a class="btn" href="https://docs.google.com/forms/d/e/1FAIpQLSdiCpmoeixrQxdm2DWbAYy2utduESC6DTTvRl7pGbf2578_gA/viewform" target="_blank" rel="noopener">Open the feedback form</a>
+    </div>
+    <figure class="qr"><img src="feedback-qr.svg" alt="QR code linking to the workshop feedback form" width="200" height="200"><figcaption>Scan with your phone</figcaption></figure>
+  </div>
+</section>
+
 <!-- ============================================================ CHEAT SHEET -->
 <section id="cheatsheet">
   <h2>Cheat sheet</h2>
@@ -636,7 +661,8 @@
     <li>Do a full dry run in a fresh Free Edition account: import, Run all, build a space, open the Curated space. Note anything that has moved in the UI.</li>
     <li>Have a backup: a pre-built Free Edition workspace you can screen-share if someone's account or network fails.</li>
   </ol></details>
-  <details class="faq"><summary>What the notebook does</summary><p>It auto-detects the catalog (<code>current_catalog()</code>, usually <code>workspace</code>) and the SQL warehouse. It builds 4 schemas, 29 tables and 4 metric views,
+  <details class="faq"><summary>What the notebooks do</summary><p>Attendees run <strong>one</strong> dataset notebook (<code>genie_nyc_aging</code>, <code>genie_nyc_transit</code>, <code>genie_nyc_water</code> or <code>genie_nyc_dohmh</code>). They're generated from the all-in-one
+  <a href="genie_byoq_nyc_workshop.py" download><code>genie_byoq_nyc_workshop.py</code></a> by <code>build_domain_notebooks.py</code>; the all-in-one builds all four datasets for a facilitator demo workspace. Each notebook auto-detects the catalog (<code>current_catalog()</code>, usually <code>workspace</code>) and the SQL warehouse. It builds 4 schemas, 29 tables and 4 metric views,
   creates a Starter space for each of the four domains, and runs every answer-key query as a self-test. <strong>Notebook 2</strong> (<code>genie_byoq_nyc_curated_spaces</code>) creates the four Curated answer-key spaces in about a minute. It's generated from notebook 1's answer key by <code>build_curated_notebook.py</code>, so the two always match. Notebook 1 widgets: <code>genie_spaces</code> (starter / both / curated / none),
   <code>metadata_level</code> (basic / rich), <code>share_with_group</code> (paid workspaces only). Re-running is safe: same seeds, same numbers, and spaces are updated in place by title.</p></details>
   <details class="faq"><summary>Demo: "metadata alone" (optional, 10 min)</summary><p>On your own workspace after Lab 3, re-run with

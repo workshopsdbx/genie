@@ -20,7 +20,6 @@
     catInput.addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
   }
   const nbUrl = $("#nb-url");
-  if (nbUrl) nbUrl.textContent = new URL("genie_byoq_nyc_workshop.py", location.href).href;
 
   /* ---------- config-driven text ---------- */
   $$(".cfg").forEach((el) => { if (CFG[el.dataset.cfg]) el.textContent = CFG[el.dataset.cfg]; });
@@ -293,6 +292,39 @@
     // UTF-8 BOM + CRLF so Excel opens it with the right encoding; Google Sheets imports it as-is.
     download(`genie-questions-${slug()}-${stamp()}.csv`, "﻿" + lines.join("\r\n"), "text/csv;charset=utf-8");
   });
+
+  /* ---------- dataset picker (setup) ---------- */
+  // Each attendee loads one dataset. Remember it, point the download/import links at its notebook,
+  // and open that dataset's tab in every tabbed section of the page.
+  const TAB_PREFIX = { data: "d-", build: "b-", traps: "t-", curate: "c-" };
+  function pickDomain(dom, save) {
+    const btn = $(`#domain-picker [data-pick="${dom}"]`);
+    if (!btn) return;
+    $$("#domain-picker button").forEach((b) => b.classList.toggle("active", b === btn));
+    const nb = btn.dataset.nb;
+    const nbAbs = new URL(nb, location.href).href;
+    $("#nb-download").innerHTML = `<a class="btn" href="${nb}" download>Download ${esc(nb)}</a>`;
+    if (nbUrl) nbUrl.textContent = nbAbs;
+    $$(".my-schema").forEach((el) => { el.textContent = btn.dataset.schema; });
+    Object.entries(TAB_PREFIX).forEach(([group, prefix]) => {
+      const tabBtn = $(`.tabs[data-tabs="${group}"] .tab-buttons button[data-tab="${prefix}${dom}"]`);
+      if (tabBtn) { tabBtn.click(); }
+    });
+    if (save) store.set("domain", dom);
+  }
+  $$("#domain-picker button").forEach((b) => b.addEventListener("click", () => pickDomain(b.dataset.pick, true)));
+  const savedDomain = store.get("domain", "");
+  if (savedDomain) pickDomain(savedDomain, false);
+
+  /* ---------- print / PDF ---------- */
+  // Open every collapsible answer while printing, then put them back.
+  let closedForPrint = [];
+  window.addEventListener("beforeprint", () => {
+    closedForPrint = $$("details:not([open])");
+    closedForPrint.forEach((d) => d.setAttribute("open", ""));
+  });
+  window.addEventListener("afterprint", () => { closedForPrint.forEach((d) => d.removeAttribute("open")); closedForPrint = []; });
+  $("#print-btn").addEventListener("click", () => window.print());
 
   /* ---------- active nav ---------- */
   const links = $$(".sidebar a");
