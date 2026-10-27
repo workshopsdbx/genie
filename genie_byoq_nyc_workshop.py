@@ -1,0 +1,2119 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Genie BYOQ Workshop — NYC Data Generator
+# MAGIC ### NYC Aging & Home Care · MTA / NYC Transit Finance · NYC DEP Water & Sewer · NYC DOHMH Food Safety & Rodents
+# MAGIC
+# MAGIC This notebook generates four self-contained, **synthetic** demo datasets for a
+# MAGIC *Bring-Your-Own-Question* (BYOQ) Genie workshop, then provisions Genie spaces for each domain.
+# MAGIC
+# MAGIC | Domain | Schema | Theme |
+# MAGIC |---|---|---|
+# MAGIC | **Aging & Home Care** (NYC Aging / HRA) | `nyc_aging_home_care` | Frail older adults, UAS-NY functional assessments, MLTC plans, home-care hours, NYC Aging program waitlists |
+# MAGIC | **Transit Finance** (MTA / NYC DOT / NYCEDC) | `nyc_transit_finance` | Operating budgets, farebox recovery, ridership & fare evasion, congestion pricing, capital program |
+# MAGIC | **Water & Sewer** (NYC DEP / Water Board) | `nyc_dep_water` | Water billing & arrears, water main breaks, 311 complaints, reservoir storage, assistance programs |
+# MAGIC | **Food Safety & Rodents** (NYC DOHMH) | `nyc_dohmh_food_safety` | Restaurant inspections & letter grades, violations, closures, rodent inspections & rat mitigation zones |
+# MAGIC
+# MAGIC Every dataset shares a `community_districts` reference table (all **59 NYC community districts**,
+# MAGIC population-weighted). Figures are **synthetic but grounded** in public NYC facts (MLTC / NYIAP,
+# MAGIC Access-A-Ride, Staten Island Ferry is fare-free, CBD tolling launched Jan 2025, Catskill/Delaware/Croton
+# MAGIC reservoirs, the Fall 2024 drought watch, NYC Water Board FY rates, DOHMH A/B/C grading bands and rat mitigation zones).
+# MAGIC Every table and column carries a
+# MAGIC `COMMENT` so Genie can reason over the model.
+# MAGIC
+# MAGIC **Runs on Databricks Free Edition** (serverless only) and on any Unity Catalog workspace. Leave `catalog` and
+# MAGIC `warehouse_id` blank to auto-detect your workspace catalog (usually `workspace`) and your SQL warehouse.
+# MAGIC
+# MAGIC **One run builds everything you need for the labs:** all four datasets, four metric views, and a ready-made
+# MAGIC **Starter** Genie space per domain (the same thing you build by hand in Lab 1, as a fallback).
+# MAGIC
+# MAGIC You curate your own space in the labs. If you get stuck or want to skip ahead, run the second notebook,
+# MAGIC **`genie_byoq_nyc_curated_spaces`**, to create the finished **Curated** answer-key spaces.
+# MAGIC (Facilitators: widget `genie_spaces` = `both` builds Starter + Curated in one go.)
+# MAGIC
+# MAGIC **Metadata level** (widget `metadata_level`): `basic` writes plain table/column descriptions, the way most
+# MAGIC agency tables look, so the Lab 3 traps fire. `rich` appends usage rules (e.g. "never SUM arrears across months")
+# MAGIC to the comments. Rebuild with `rich` to demo how much good Unity Catalog metadata fixes before any Genie curation.
+# MAGIC
+# MAGIC Re-running is **idempotent**: tables are overwritten, and Genie spaces are matched by title and updated in place.
+# MAGIC
+# MAGIC **How to run:** connect to **Serverless** (top right), then click **Run all**. It takes about 5–10 minutes.
+
+# COMMAND ----------
+
+# MAGIC %md ## 0 · Configuration
+
+# COMMAND ----------
+
+# Leave catalog / warehouse_id blank to auto-detect (Databricks Free Edition: the "workspace" catalog + Serverless Starter Warehouse)
+dbutils.widgets.text("catalog", "", "Unity Catalog (blank = auto)")
+dbutils.widgets.text("warehouse_id", "", "SQL Warehouse ID (blank = auto)")
+dbutils.widgets.dropdown("genie_spaces", "starter", ["starter", "both", "curated", "none"], "Genie spaces to create/update")
+dbutils.widgets.text("share_with_group", "", "Grant attendees access (group name, optional)")
+# basic = plain descriptions (traps fire in Starter spaces); rich = descriptions + usage rules (shows how far UC metadata alone gets you)
+dbutils.widgets.dropdown("metadata_level", "basic", ["basic", "rich"], "UC comment richness")
+
+CATALOG = dbutils.widgets.get("catalog").strip()
+if not CATALOG:
+    CATALOG = spark.sql("SELECT current_catalog()").first()[0]
+    if CATALOG in (None, "", "hive_metastore", "spark_catalog", "system", "samples"):
+        CATALOG = "workspace"
+WAREHOUSE_ID = dbutils.widgets.get("warehouse_id").strip()
+GENIE_MODE = dbutils.widgets.get("genie_spaces").strip()
+SHARE_GROUP = dbutils.widgets.get("share_with_group").strip()
+RICH_METADATA = dbutils.widgets.get("metadata_level").strip() == "rich"
+
+SCHEMA_AGING = "nyc_aging_home_care"
+SCHEMA_TRANSIT = "nyc_transit_finance"
+SCHEMA_WATER = "nyc_dep_water"
+SCHEMA_HEALTH = "nyc_dohmh_food_safety"
+ALL_SCHEMAS = (SCHEMA_AGING, SCHEMA_TRANSIT, SCHEMA_WATER, SCHEMA_HEALTH)
+
+print(f"Catalog        : {CATALOG}")
+print(f"Warehouse ID   : {WAREHOUSE_ID or '(auto-detect before creating Genie spaces)'}")
+print(f"Genie spaces   : {GENIE_MODE}")
+print(f"Share w/ group : {SHARE_GROUP or '(none)'}")
+print(f"Metadata level : {'rich' if RICH_METADATA else 'basic'}")
+
+# COMMAND ----------
+
+import math
+import random
+import datetime as dt
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType, StructField, StringType, IntegerType, LongType,
+    DoubleType, BooleanType, DateType,
+)
+
+# Deterministic output across re-runs
+MASTER_SEED = 20261026
+
+
+def _schema(*fields):
+    """fields = (name, type) tuples -> StructType (all nullable)."""
+    return StructType([StructField(n, t, True) for n, t in fields])
+
+
+RULE = " RULE: "  # text after this marker is a usage rule, only written when metadata_level = rich
+
+
+def _meta(text):
+    head, _, rule = text.partition(RULE)
+    return f"{head} {rule}" if (rule and RICH_METADATA) else head
+
+
+def add_comments(fq_name, table_comment, col_comments):
+    table_comment = _meta(table_comment)
+    col_comments = {c: _meta(t) for c, t in col_comments.items()}
+    safe_tbl = table_comment.replace("'", "''")
+    spark.sql(f"COMMENT ON TABLE {fq_name} IS '{safe_tbl}'")
+    for col, comment in col_comments.items():
+        safe = comment.replace("'", "''")
+        spark.sql(f"ALTER TABLE {fq_name} ALTER COLUMN {col} COMMENT '{safe}'")
+
+
+def build_table(fq_name, struct, rows, table_comment, col_comments):
+    """Create a managed Delta table from python rows + attach table/column comments."""
+    df = spark.createDataFrame(rows, struct)
+    df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(fq_name)
+    add_comments(fq_name, table_comment, col_comments)
+    print(f"  ✓ {fq_name}  ({len(rows):,} rows)")
+
+
+for schema in ALL_SCHEMAS:
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{schema}")
+print("Schemas ready.")
+
+# COMMAND ----------
+
+# MAGIC %md ### NYC community-district reference (59 districts, approx. 2020 population in thousands)
+
+# COMMAND ----------
+
+NYC_CDS = [
+    # Manhattan
+    ("MN01", "Financial District / Tribeca", "Manhattan", 63), ("MN02", "Greenwich Village / SoHo", "Manhattan", 92),
+    ("MN03", "Lower East Side / Chinatown", "Manhattan", 164), ("MN04", "Chelsea / Clinton", "Manhattan", 118),
+    ("MN05", "Midtown", "Manhattan", 64), ("MN06", "Murray Hill / Stuyvesant Town", "Manhattan", 152),
+    ("MN07", "Upper West Side", "Manhattan", 222), ("MN08", "Upper East Side", "Manhattan", 225),
+    ("MN09", "Morningside Heights / Hamilton Heights", "Manhattan", 111), ("MN10", "Central Harlem", "Manhattan", 128),
+    ("MN11", "East Harlem", "Manhattan", 125), ("MN12", "Washington Heights / Inwood", "Manhattan", 203),
+    # Bronx
+    ("BX01", "Mott Haven / Melrose", "Bronx", 99), ("BX02", "Hunts Point / Longwood", "Bronx", 56),
+    ("BX03", "Morrisania / Crotona", "Bronx", 89), ("BX04", "Highbridge / Concourse", "Bronx", 154),
+    ("BX05", "Fordham / University Heights", "Bronx", 138), ("BX06", "Belmont / East Tremont", "Bronx", 94),
+    ("BX07", "Kingsbridge Heights / Bedford", "Bronx", 145), ("BX08", "Riverdale / Fieldston", "Bronx", 112),
+    ("BX09", "Parkchester / Soundview", "Bronx", 185), ("BX10", "Throgs Neck / Co-op City", "Bronx", 126),
+    ("BX11", "Morris Park / Bronxdale", "Bronx", 122), ("BX12", "Williamsbridge / Wakefield", "Bronx", 160),
+    # Brooklyn
+    ("BK01", "Greenpoint / Williamsburg", "Brooklyn", 199), ("BK02", "Downtown Brooklyn / Fort Greene", "Brooklyn", 129),
+    ("BK03", "Bedford-Stuyvesant", "Brooklyn", 166), ("BK04", "Bushwick", "Brooklyn", 117),
+    ("BK05", "East New York / Starrett City", "Brooklyn", 202), ("BK06", "Park Slope / Carroll Gardens", "Brooklyn", 122),
+    ("BK07", "Sunset Park / Windsor Terrace", "Brooklyn", 140), ("BK08", "Crown Heights North / Prospect Heights", "Brooklyn", 104),
+    ("BK09", "Crown Heights South / Prospect Lefferts", "Brooklyn", 95), ("BK10", "Bay Ridge / Dyker Heights", "Brooklyn", 140),
+    ("BK11", "Bensonhurst / Bath Beach", "Brooklyn", 204), ("BK12", "Borough Park / Kensington", "Brooklyn", 191),
+    ("BK13", "Coney Island / Brighton Beach", "Brooklyn", 112), ("BK14", "Flatbush / Midwood", "Brooklyn", 165),
+    ("BK15", "Sheepshead Bay / Gravesend", "Brooklyn", 165), ("BK16", "Brownsville / Ocean Hill", "Brooklyn", 99),
+    ("BK17", "East Flatbush / Farragut", "Brooklyn", 155), ("BK18", "Canarsie / Flatlands", "Brooklyn", 197),
+    # Queens
+    ("QN01", "Astoria / Long Island City", "Queens", 199), ("QN02", "Sunnyside / Woodside", "Queens", 135),
+    ("QN03", "Jackson Heights / North Corona", "Queens", 177), ("QN04", "Elmhurst / South Corona", "Queens", 151),
+    ("QN05", "Ridgewood / Maspeth", "Queens", 174), ("QN06", "Forest Hills / Rego Park", "Queens", 121),
+    ("QN07", "Flushing / Whitestone", "Queens", 263), ("QN08", "Fresh Meadows / Briarwood", "Queens", 158),
+    ("QN09", "Kew Gardens / Woodhaven", "Queens", 147), ("QN10", "Howard Beach / Ozone Park", "Queens", 128),
+    ("QN11", "Bayside / Little Neck", "Queens", 122), ("QN12", "Jamaica / Hollis", "Queens", 248),
+    ("QN13", "Queens Village / Rosedale", "Queens", 206), ("QN14", "Rockaway / Broad Channel", "Queens", 126),
+    # Staten Island
+    ("SI01", "North Shore", "Staten Island", 191), ("SI02", "Mid-Island", "Staten Island", 139),
+    ("SI03", "South Shore", "Staten Island", 165),
+]
+assert len(NYC_CDS) == 59
+CD_BY_CODE = {c[0]: c for c in NYC_CDS}
+BOROUGHS = ["Manhattan", "Bronx", "Brooklyn", "Queens", "Staten Island"]
+
+
+def weighted_cds(rng, n, borough=None):
+    pool = [c for c in NYC_CDS if borough is None or c[2] == borough]
+    return rng.choices(pool, weights=[c[3] for c in pool], k=n)
+
+
+def build_cd_table(schema):
+    build_table(
+        f"{CATALOG}.{schema}.community_districts",
+        _schema(("community_district", StringType()), ("cd_name", StringType()),
+                ("borough", StringType()), ("population", IntegerType())),
+        [(code, name, boro, pop * 1000) for code, name, boro, pop in NYC_CDS],
+        "Reference list of the 59 New York City community districts with borough and approximate 2020 population. Grain: one row per community district.",
+        {"community_district": "Community district code: borough prefix (MN, BX, BK, QN, SI) + 2-digit district number, e.g. BK05. Join key to other tables.",
+         "cd_name": "Common neighborhood name(s) for the community district.",
+         "borough": "NYC borough: Manhattan, Bronx, Brooklyn, Queens or Staten Island.",
+         "population": "Approximate resident population (2020 Census)."},
+    )
+
+
+for schema in ALL_SCHEMAS:
+    build_cd_table(schema)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 1 · NYC Aging & Home Care  (`nyc_aging_home_care`)
+# MAGIC
+# MAGIC Models the view shared by **NYC Aging** (formerly DFTA), **HRA**, and NYS Medicaid of frail older New
+# MAGIC Yorkers: Medicaid Managed Long-Term Care (MLTC) enrollment, UAS-NY functional assessments performed by the
+# MAGIC NY Independent Assessor Program (NYIAP), monthly home-care utilization, City-funded aging-program waitlists
+# MAGIC and community-district roll-ups.
+
+# COMMAND ----------
+
+rng = random.Random(MASTER_SEED + 1)
+
+# ---- mltc_plans ----
+MLTC_PLANS = [
+    ("PL-01", "VNS Health MLTC", "MLTC (Partial Capitation)"),
+    ("PL-02", "Centers Plan for Healthy Living", "MLTC (Partial Capitation)"),
+    ("PL-03", "ElderServe Health", "MLTC (Partial Capitation)"),
+    ("PL-04", "Fidelis Care MLTC", "MLTC (Partial Capitation)"),
+    ("PL-05", "AgeWell New York", "MLTC (Partial Capitation)"),
+    ("PL-06", "Healthfirst CompleteCare", "Medicaid Advantage Plus (MAP)"),
+    ("PL-07", "ArchCare Senior Life", "PACE"),
+]
+PLAN_WEIGHTS = [26, 18, 14, 16, 10, 12, 4]
+plan_rows = []
+for (pid, name, ptype), w in zip(MLTC_PLANS, PLAN_WEIGHTS):
+    plan_rows.append((pid, name, ptype, int(w * rng.uniform(950, 1150) * 10),
+                      round(rng.uniform(74, 92), 1), round(rng.uniform(0.82, 0.95), 3),
+                      rng.randint(9, 41)))
+build_table(
+    f"{CATALOG}.{SCHEMA_AGING}.mltc_plans",
+    _schema(("plan_id", StringType()), ("plan_name", StringType()), ("plan_type", StringType()),
+            ("nyc_enrollment", LongType()), ("quality_score", DoubleType()),
+            ("care_plan_completion_rate", DoubleType()), ("avg_days_to_service_start", IntegerType())),
+    plan_rows,
+    "Medicaid managed long-term care plans serving NYC (MLTC partial-capitation, Medicaid Advantage Plus, PACE) with NYC enrollment and quality metrics. Plan names are real; all metrics are synthetic.",
+    {"plan_id": "Plan identifier (joins clients.plan_id).",
+     "plan_name": "Managed long-term care plan name.",
+     "plan_type": "Product type: MLTC (Partial Capitation), Medicaid Advantage Plus (MAP), or PACE.",
+     "nyc_enrollment": "Members enrolled in the plan who live in NYC.",
+     "quality_score": "Composite plan quality score 0-100 (higher is better).",
+     "care_plan_completion_rate": "Share of members with a completed person-centered service plan, 0-1.",
+     "avg_days_to_service_start": "Average calendar days from enrollment to first authorized home-care service (lower is better)."},
+)
+
+# ---- aging_programs (City-funded, with waitlists) ----
+AGING_PROGRAMS = [
+    ("Home-Delivered Meals", "NYC Aging", "City + Federal (OAA Title III-C)", 18_400, 640, 3_900),
+    ("Case Management", "NYC Aging", "City + State", 31_000, 1_850, 1_650),
+    ("EISEP Home Care", "NYC Aging", "State (EISEP) + City", 3_600, 2_350, 14_200),
+    ("Older Adult Centers", "NYC Aging", "City + Federal (OAA Title III)", 152_000, 0, 950),
+    ("NORC Supportive Services", "NYC Aging", "City + State", 21_500, 310, 1_100),
+    ("Caregiver Support", "NYC Aging", "Federal (OAA Title III-E)", 6_100, 480, 1_300),
+    ("Elder Justice / Abuse Prevention", "NYC Aging", "City", 2_700, 0, 2_800),
+    ("HRA Home Care Services Program", "HRA", "Medicaid", 41_000, 0, 48_000),
+]
+prog_rows = [(n, a, f, e, w, c, round(rng.uniform(84, 99), 1)) for n, a, f, e, w, c in AGING_PROGRAMS]
+build_table(
+    f"{CATALOG}.{SCHEMA_AGING}.aging_programs",
+    _schema(("program_name", StringType()), ("administering_agency", StringType()), ("funding_source", StringType()),
+            ("enrolled", LongType()), ("waitlist", IntegerType()), ("avg_annual_cost_usd", IntegerType()),
+            ("service_utilization_pct", DoubleType())),
+    prog_rows,
+    "NYC aging-services and home-care programs (NYC Aging and HRA) with current enrollment, waitlist and average annual cost per participant. Grain: one row per program.",
+    {"program_name": "Program name. EISEP = Expanded In-home Services for the Elderly Program (non-Medicaid home care). NORC = Naturally Occurring Retirement Community.",
+     "administering_agency": "City agency administering the program: NYC Aging (formerly DFTA) or HRA (Human Resources Administration).",
+     "funding_source": "Primary funding streams. OAA = federal Older Americans Act.",
+     "enrolled": "Participants currently enrolled / served.",
+     "waitlist": "Older adults currently on the program waitlist (higher = worse access).",
+     "avg_annual_cost_usd": "Average annual cost per participant, USD.",
+     "service_utilization_pct": "Percent of authorized service units actually delivered, 0-100."},
+)
+
+# COMMAND ----------
+
+# ---- clients ----
+N_CLIENTS = 9000
+LANGS = ["English", "Spanish", "Chinese", "Russian", "Bengali", "Haitian Creole", "Korean", "Yiddish", "Other"]
+LANG_W_BY_BORO = {
+    "Manhattan": [52, 26, 12, 2, 1, 1, 1, 1, 4],
+    "Bronx": [42, 46, 1, 1, 3, 1, 0, 0, 6],
+    "Brooklyn": [44, 14, 12, 12, 3, 7, 0, 5, 3],
+    "Queens": [38, 22, 18, 3, 7, 3, 6, 0, 3],
+    "Staten Island": [70, 12, 5, 7, 1, 1, 1, 0, 3],
+}
+plan_ids = [p[0] for p in MLTC_PLANS]
+client_cds = weighted_cds(rng, N_CLIENTS)
+clients = []
+for i in range(N_CLIENTS):
+    code, _, boro, _ = client_cds[i]
+    age = rng.choices([rng.randint(50, 64), rng.randint(65, 74), rng.randint(75, 84), rng.randint(85, 101)],
+                      weights=[18, 34, 30, 18])[0]
+    dual = age >= 65 and rng.random() < 0.62
+    frail_p = 0.08 + 0.15 * (age >= 65) + 0.17 * (age >= 75) + 0.15 * (age >= 85)
+    frail = rng.random() < frail_p
+    if dual and frail and rng.random() < 0.8:
+        coverage = "Medicaid MLTC"
+    elif age >= 65 and not dual and rng.random() < 0.6:
+        coverage = "Medicare Only"
+    else:
+        coverage = rng.choices(["Medicaid Mainstream Managed Care", "Medicaid Fee-for-Service", "Medicaid MLTC"],
+                               weights=[60, 25, 15])[0]
+    clients.append((
+        f"C{200000 + i}", code, boro, age, rng.choice(["F", "F", "F", "M", "M"]),
+        rng.choices(LANGS, weights=LANG_W_BY_BORO[boro])[0],
+        coverage,
+        rng.choices(plan_ids, weights=PLAN_WEIGHTS)[0] if coverage == "Medicaid MLTC" else None,
+        bool(dual), bool(frail),
+        rng.random() < (0.42 if age >= 75 else 0.30),
+        rng.randint(1, 120),
+        rng.choices(["Active", "Pending Assessment", "Disenrolled"], weights=[82, 8, 10])[0],
+    ))
+build_table(
+    f"{CATALOG}.{SCHEMA_AGING}.clients",
+    _schema(("client_id", StringType()), ("community_district", StringType()), ("borough", StringType()),
+            ("age", IntegerType()), ("sex", StringType()), ("primary_language", StringType()),
+            ("coverage_type", StringType()), ("plan_id", StringType()), ("dual_eligible", BooleanType()),
+            ("medically_frail", BooleanType()), ("living_alone", BooleanType()),
+            ("months_enrolled", IntegerType()), ("enrollment_status", StringType())),
+    clients,
+    "Older and disabled New Yorkers known to NYC aging / home-care services, with coverage, dual-eligibility, frailty and living-alone flags. Grain: one row per client.",
+    {"client_id": "Unique client identifier.",
+     "community_district": "Community district of residence (joins community_districts.community_district).",
+     "borough": "NYC borough of residence.",
+     "age": "Client age in years.",
+     "sex": "Client sex (F/M).",
+     "primary_language": "Preferred spoken language.",
+     "coverage_type": "Coverage: Medicaid MLTC (managed long-term care), Medicaid Mainstream Managed Care, Medicaid Fee-for-Service, or Medicare Only (City-funded services only).",
+     "plan_id": "MLTC plan (joins mltc_plans.plan_id); null unless coverage_type = Medicaid MLTC.",
+     "dual_eligible": "TRUE if eligible for both Medicaid and Medicare.",
+     "medically_frail": "TRUE if the client carries a medically-frail designation (high functional need; priority for home care).",
+     "living_alone": "TRUE if the client lives alone (key social-isolation risk factor).",
+     "months_enrolled": "Months continuously known to services.",
+     "enrollment_status": "Current status: Active, Pending Assessment, or Disenrolled."},
+)
+
+# COMMAND ----------
+
+# ---- functional_assessments (UAS-NY via NYIAP) ----
+ASSESSORS = ["NYIAP Community Health Assessment", "MLTC Plan Nurse Reassessment", "Hospital Discharge (NYIAP)"]
+a_base = dt.date(2025, 1, 1)
+assessments = []
+aid = 0
+for c in clients:
+    client_id, code, boro, age, frail = c[0], c[1], c[2], c[3], c[9]
+    if not frail and rng.random() > 0.5:
+        continue
+    # frailer clients are reassessed more often, so counting every assessment row over-states need
+    for _ in range(rng.choices([1, 2, 3, 4], weights=[25, 35, 25, 15] if frail else [88, 11, 1, 0])[0]):
+        adl = rng.randint(3, 6) if frail else rng.randint(0, 3)
+        iadl = rng.randint(4, 8) if frail else rng.randint(0, 5)
+        cog = rng.randint(2, 5) if frail else rng.randint(0, 3)
+        mob = rng.randint(2, 4) if frail else rng.randint(0, 2)
+        fi = round(min(0.98, adl / 6 * 0.4 + iadl / 8 * 0.25 + cog / 5 * 0.2 + mob / 4 * 0.15), 3)
+        # NYS 2025 minimum-needs rule for new personal care / CDPAP: help with >2 ADLs (or >1 with dementia)
+        meets_min = adl >= 3 or (cog >= 3 and adl >= 2)
+        assessments.append((
+            f"A{500000 + aid}", client_id, code, a_base + dt.timedelta(days=rng.randint(0, 637)),
+            adl, iadl, cog, mob, fi, bool(fi >= 0.5), bool(meets_min), rng.choice(ASSESSORS),
+        ))
+        aid += 1
+build_table(
+    f"{CATALOG}.{SCHEMA_AGING}.functional_assessments",
+    _schema(("assessment_id", StringType()), ("client_id", StringType()), ("community_district", StringType()),
+            ("assessment_date", DateType()), ("adl_dependencies", IntegerType()), ("iadl_dependencies", IntegerType()),
+            ("cognitive_score", IntegerType()), ("mobility_limitation", IntegerType()), ("frailty_index", DoubleType()),
+            ("nursing_facility_loc", BooleanType()), ("meets_min_adl_need", BooleanType()), ("assessor_type", StringType())),
+    assessments,
+    "UAS-NY functional assessments (performed through the NY Independent Assessor Program, NYIAP) that determine home-care and nursing-facility eligibility. Grain: one row per assessment; a client can have several. RULE: Use the most recent assessment per client for current status.",
+    {"assessment_id": "Unique assessment identifier.",
+     "client_id": "Client assessed (joins clients.client_id).",
+     "community_district": "Client's community district at assessment.",
+     "assessment_date": "Date the assessment was conducted.",
+     "adl_dependencies": "Activities of Daily Living needing hands-on help (0-6; higher = more impaired).",
+     "iadl_dependencies": "Instrumental Activities of Daily Living needing help (0-8; higher = more impaired).",
+     "cognitive_score": "Cognitive-impairment severity 0-5 (higher = more impaired).",
+     "mobility_limitation": "Mobility-limitation severity 0-4 (higher = more impaired).",
+     "frailty_index": "Composite frailty index 0-1 from ADL/IADL/cognition/mobility; higher = more frail.",
+     "nursing_facility_loc": "TRUE if the assessment found nursing-facility level of care (frailty_index >= 0.5).",
+     "meets_min_adl_need": "TRUE if the client meets the NYS minimum-needs rule for personal care/CDPAP (help with more than 2 ADLs, or more than 1 with dementia).",
+     "assessor_type": "Who performed the assessment."},
+)
+
+# COMMAND ----------
+
+# ---- home_care_services (6 months) ----
+#   (category, unit, min units/mo, max units/mo, unit cost USD, funding)
+SERVICE_CATS = [
+    ("Personal Care (Home Attendant)", "hour", 60, 300, 31, "Medicaid"),
+    ("CDPAP (Consumer Directed)", "hour", 60, 320, 27, "Medicaid"),
+    ("Certified Home Health Aide (CHHA)", "hour", 20, 120, 36, "Medicaid"),
+    ("Adult Day Health Care", "day", 4, 22, 185, "Medicaid"),
+    ("Nursing Home", "day", 28, 31, 425, "Medicaid"),
+    ("Home-Delivered Meals", "meal", 20, 60, 12, "NYC Aging"),
+    ("Case Management", "hour", 1, 6, 95, "NYC Aging"),
+    ("Social Adult Day Care", "day", 4, 16, 95, "NYC Aging"),
+]
+LIGHT_CATS = [s for s in SERVICE_CATS if s[5] == "NYC Aging"]
+SVC_MONTHS = [dt.date(2026, m, 1) for m in range(4, 10)]
+svc_rows = []
+sid = 0
+for c in clients:
+    client_id, code, frail, status = c[0], c[1], c[9], c[12]
+    if status == "Disenrolled":
+        continue
+    if frail:
+        cats = rng.sample(SERVICE_CATS, k=rng.randint(1, 3))
+    elif rng.random() < 0.22:
+        cats = rng.sample(LIGHT_CATS, k=rng.randint(1, 2))
+    else:
+        continue
+    for cat, unit, umin, umax, unit_cost, funding in cats:
+        level = rng.randint(umin, umax)
+        for month in SVC_MONTHS:
+            units = max(1, int(level * rng.uniform(0.88, 1.08)))
+            svc_rows.append((f"S{700000 + sid}", client_id, code, month, cat, unit, funding, units,
+                             round(units * unit_cost * rng.uniform(0.95, 1.08), 2)))
+            sid += 1
+build_table(
+    f"{CATALOG}.{SCHEMA_AGING}.home_care_services",
+    _schema(("service_record_id", StringType()), ("client_id", StringType()), ("community_district", StringType()),
+            ("service_month", DateType()), ("service_category", StringType()), ("unit_type", StringType()),
+            ("funding_source", StringType()), ("units_delivered", IntegerType()), ("cost_usd", DoubleType())),
+    svc_rows,
+    "Monthly home-care and aging-services utilization (Apr-Sep 2026). Grain: one row per client per service category per month.",
+    {"service_record_id": "Unique service-record identifier.",
+     "client_id": "Client served (joins clients.client_id).",
+     "community_district": "Community district where the service was delivered.",
+     "service_month": "Service month (first day of month).",
+     "service_category": "Service type, e.g. Personal Care, CDPAP, CHHA, Adult Day Health Care, Nursing Home, Home-Delivered Meals, Case Management.",
+     "unit_type": "Unit for units_delivered: hour, day or meal.",
+     "funding_source": "Payer: Medicaid or NYC Aging (City-funded).",
+     "units_delivered": "Units delivered in the month (see unit_type).",
+     "cost_usd": "Total cost of the service for the month, USD."},
+)
+
+# COMMAND ----------
+
+# ---- cd_aging_metrics (roll-up) ----
+c_df = spark.table(f"{CATALOG}.{SCHEMA_AGING}.clients")
+a_df = spark.table(f"{CATALOG}.{SCHEMA_AGING}.functional_assessments")
+s_df = spark.table(f"{CATALOG}.{SCHEMA_AGING}.home_care_services")
+cd_df = spark.table(f"{CATALOG}.{SCHEMA_AGING}.community_districts")
+latest_month = s_df.agg(F.max("service_month")).first()[0]
+
+cd_metrics = (
+    cd_df.select("community_district", "borough", "population")
+    .join(c_df.groupBy("community_district").agg(
+        F.count("*").alias("clients"),
+        F.sum(F.col("medically_frail").cast("int")).alias("medically_frail_clients"),
+        F.sum((F.col("medically_frail") & F.col("living_alone")).cast("int")).alias("frail_living_alone"),
+        F.sum(F.col("dual_eligible").cast("int")).alias("dual_eligible_clients"),
+    ), "community_district", "left")
+    .join(a_df.groupBy("community_district").agg(
+        F.round(F.avg("frailty_index"), 3).alias("avg_frailty_index"),
+        F.round(F.avg(F.col("nursing_facility_loc").cast("int")) * 100, 1).alias("nursing_facility_loc_pct"),
+    ), "community_district", "left")
+    .join(s_df.filter(F.col("service_month") == F.lit(latest_month)).groupBy("community_district").agg(
+        F.round(F.sum("cost_usd"), 0).alias("latest_month_service_cost_usd"),
+    ), "community_district", "left")
+    .fillna(0)
+    .withColumn("frail_per_10k_residents",
+                F.round(F.col("medically_frail_clients") / F.col("population") * 10000, 2))
+)
+cd_metrics.write.mode("overwrite").option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{SCHEMA_AGING}.cd_aging_metrics")
+add_comments(
+    f"{CATALOG}.{SCHEMA_AGING}.cd_aging_metrics",
+    "Pre-aggregated community-district roll-up of client, frailty and service-cost metrics. Grain: one row per community district.",
+    {"community_district": "Community district code.",
+     "borough": "NYC borough.",
+     "population": "Resident population of the district.",
+     "clients": "Clients known to aging / home-care services.",
+     "medically_frail_clients": "Clients with a medically-frail designation.",
+     "frail_living_alone": "Medically-frail clients who live alone.",
+     "dual_eligible_clients": "Clients dual-eligible for Medicaid + Medicare.",
+     "avg_frailty_index": "Average frailty index (0-1) across all assessments in the district.",
+     "nursing_facility_loc_pct": "Percent of assessments finding nursing-facility level of care.",
+     "latest_month_service_cost_usd": "Total home-care/aging service cost in the most recent service month, USD.",
+     "frail_per_10k_residents": "Medically-frail clients per 10,000 residents."},
+)
+print(f"  ✓ {CATALOG}.{SCHEMA_AGING}.cd_aging_metrics")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2 · Transit Finance  (`nyc_transit_finance`)
+# MAGIC
+# MAGIC An OMB-style view of NYC public-transit finance across MTA operating agencies plus the City-run ferries:
+# MAGIC monthly revenue vs. expense, farebox recovery, ridership and fare evasion, Central Business District
+# MAGIC (congestion pricing) toll revenue, funding sources, and the capital program.
+
+# COMMAND ----------
+
+rng = random.Random(MASTER_SEED + 2)
+
+# (agency_id, name, operator, mode, annual op budget $M, base monthly trips (M), farebox target,
+#  revenue miles per trip, avg speed mph, est. fare evasion)
+AGENCIES = [
+    ("NYCT-SUB", "NYC Transit - Subway", "MTA", "Heavy Rail", 8900, 100.0, 0.33, 0.30, 17, 0.13),
+    ("NYCT-BUS", "NYC Transit - Bus", "MTA", "Bus", 3600, 38.0, 0.12, 0.25, 7.5, 0.44),
+    ("MTABC", "MTA Bus Company", "MTA", "Bus", 1000, 9.5, 0.12, 0.32, 8.5, 0.40),
+    ("SIR", "Staten Island Railway", "MTA", "Heavy Rail", 95, 0.45, 0.07, 0.90, 22, 0.05),
+    ("LIRR", "Long Island Rail Road", "MTA", "Commuter Rail", 2050, 7.2, 0.33, 1.10, 30, 0.04),
+    ("MNR", "Metro-North Railroad", "MTA", "Commuter Rail", 1850, 6.4, 0.40, 1.30, 32, 0.04),
+    ("AAR", "Access-A-Ride Paratransit", "MTA", "Paratransit", 720, 0.85, 0.04, 9.0, 14, 0.0),
+    ("SIF", "Staten Island Ferry", "NYC DOT", "Ferry", 145, 1.4, 0.0, 0.008, 14, 0.0),
+    ("NYCF", "NYC Ferry", "NYCEDC", "Ferry", 115, 0.6, 0.27, 0.05, 16, 0.02),
+]
+agency_rows = [(a[0], a[1], a[2], a[3], float(a[4]), round(a[5] * 12, 2)) for a in AGENCIES]
+build_table(
+    f"{CATALOG}.{SCHEMA_TRANSIT}.transit_agencies",
+    _schema(("agency_id", StringType()), ("agency_name", StringType()), ("operator", StringType()),
+            ("mode", StringType()), ("annual_operating_budget_m", DoubleType()),
+            ("annual_ridership_target_m", DoubleType())),
+    agency_rows,
+    "NYC-area public-transit operating agencies (MTA agencies, NYC DOT Staten Island Ferry, NYCEDC NYC Ferry) with annual operating budget. Grain: one row per agency.",
+    {"agency_id": "Short agency code (join key).",
+     "agency_name": "Full agency / service name.",
+     "operator": "Parent operator: MTA, NYC DOT or NYCEDC.",
+     "mode": "Transit mode: Heavy Rail, Bus, Commuter Rail, Paratransit or Ferry.",
+     "annual_operating_budget_m": "Adopted annual operating budget, millions USD.",
+     "annual_ridership_target_m": "Budgeted annual ridership, millions of trips."},
+)
+
+# COMMAND ----------
+
+# ---- monthly_financials + ridership (36 months: Oct 2023 - Sep 2026) ----
+MONTHS = []
+y, mth = 2023, 10
+while (y, mth) <= (2026, 9):
+    MONTHS.append(dt.date(y, mth, 1))
+    y, mth = (y + 1, 1) if mth == 12 else (y, mth + 1)
+
+fin_rows, ride_rows = [], []
+for aid, name, op, mode, budget_m, trips_m, fr_target, mpt, mph, evasion in AGENCIES:
+    monthly_base = budget_m / 12.0
+    for i, month in enumerate(MONTHS):
+        season = 1.0 + 0.04 * (month.month in (9, 10, 11)) - 0.06 * (month.month in (7, 8)) - 0.03 * (month.month == 12)
+        trend = 0.92 + 0.10 * (i / (len(MONTHS) - 1))
+        exp = monthly_base * rng.uniform(0.95, 1.07) * (1 + 0.03 * i / 12)  # ~3%/yr cost growth
+        labor = round(exp * rng.uniform(0.58, 0.66), 3)
+        fuel = round(exp * rng.uniform(0.05, 0.10), 3)
+        materials = round(exp * rng.uniform(0.06, 0.10), 3)
+        other_exp = round(exp - labor - fuel - materials, 3)
+        total_exp = round(labor + fuel + materials + other_exp, 3)
+        fare = round(total_exp * fr_target * season * trend, 3)
+        federal = round(total_exp * rng.uniform(0.02, 0.06), 3)
+        other_rev = round(total_exp * rng.uniform(0.02, 0.05), 3)
+        coverage = rng.uniform(0.93, 1.04)  # how much of expense total revenue covers this month
+        gap = max(0.0, total_exp * coverage - fare - federal - other_rev)
+        if op == "MTA":
+            dedicated = round(gap * rng.uniform(0.70, 0.82), 3)
+            subsidy = round(gap - dedicated, 3)
+        else:  # City-run ferries are funded from the City general fund
+            dedicated = 0.0
+            subsidy = round(gap, 3)
+        total_rev = round(fare + dedicated + subsidy + federal + other_rev, 3)
+        bal = round(total_rev - total_exp, 3)
+        fin_rows.append((aid, month, month.year, fare, dedicated, subsidy, federal, other_rev,
+                         labor, fuel, materials, other_exp, total_rev, total_exp, bal,
+                         round(fare / total_exp, 4)))
+        trips = int(trips_m * 1_000_000 * season * trend * rng.uniform(0.97, 1.03))
+        miles = int(trips * mpt * rng.uniform(0.95, 1.05))
+        hours = int(miles / mph)
+        public_support = (dedicated + subsidy + federal) * 1_000_000
+        ride_rows.append((aid, month, trips, int(trips / 30.4 * 1.18), miles, hours,
+                          round(public_support / max(trips, 1), 2),
+                          round(min(0.6, max(0.0, evasion * rng.uniform(0.9, 1.1) * (1.05 - 0.10 * i / len(MONTHS)))), 3),
+                          round(rng.uniform(78, 86) if mode != "Commuter Rail" else rng.uniform(90, 96), 1)))
+
+build_table(
+    f"{CATALOG}.{SCHEMA_TRANSIT}.monthly_financials",
+    _schema(("agency_id", StringType()), ("month", DateType()), ("calendar_year", IntegerType()),
+            ("fare_revenue_m", DoubleType()), ("dedicated_taxes_m", DoubleType()), ("state_city_subsidy_m", DoubleType()),
+            ("federal_funds_m", DoubleType()), ("other_revenue_m", DoubleType()), ("labor_expense_m", DoubleType()),
+            ("fuel_power_expense_m", DoubleType()), ("materials_expense_m", DoubleType()), ("other_expense_m", DoubleType()),
+            ("total_revenue_m", DoubleType()), ("total_expense_m", DoubleType()), ("operating_balance_m", DoubleType()),
+            ("farebox_recovery_ratio", DoubleType())),
+    fin_rows,
+    "Monthly operating finance by agency, Oct 2023 - Sep 2026: revenue by source, expense by category, operating balance and farebox recovery. All _m columns are MILLIONS of USD. Grain: one row per agency per month.",
+    {"agency_id": "Agency (joins transit_agencies.agency_id).",
+     "month": "Reporting month (first day of month).",
+     "calendar_year": "Calendar year of the month (the MTA fiscal year equals the calendar year).",
+     "fare_revenue_m": "Passenger fare revenue, $M. Staten Island Ferry is fare-free, so this is 0 for SIF.",
+     "dedicated_taxes_m": "Dedicated transit taxes and fees (Payroll Mobility Tax, MMTOA, Petroleum Business Tax, mortgage recording taxes), $M. MTA agencies only.",
+     "state_city_subsidy_m": "State and City operating subsidies and reimbursements (incl. City general-fund support for the ferries), $M.",
+     "federal_funds_m": "Federal operating assistance (FTA), $M.",
+     "other_revenue_m": "Other operating revenue (advertising, real estate, concessions), $M.",
+     "labor_expense_m": "Payroll, overtime, pensions and health benefits, $M.",
+     "fuel_power_expense_m": "Diesel fuel and traction power, $M.",
+     "materials_expense_m": "Materials and supplies, $M.",
+     "other_expense_m": "All other operating expense (contracts, insurance, claims), $M.",
+     "total_revenue_m": "Total operating revenue, $M.",
+     "total_expense_m": "Total operating expense, $M.",
+     "operating_balance_m": "Total revenue minus total expense, $M (negative = operating deficit).",
+     "farebox_recovery_ratio": "Fare revenue / total operating expense for the month (0-1). RULE: To aggregate across months or agencies, use SUM(fare_revenue_m)/SUM(total_expense_m), not an average of this column."},
+)
+build_table(
+    f"{CATALOG}.{SCHEMA_TRANSIT}.ridership",
+    _schema(("agency_id", StringType()), ("month", DateType()), ("total_trips", LongType()),
+            ("avg_weekday_trips", LongType()), ("revenue_vehicle_miles", LongType()), ("revenue_vehicle_hours", LongType()),
+            ("public_subsidy_per_trip_usd", DoubleType()), ("est_fare_evasion_rate", DoubleType()),
+            ("on_time_performance_pct", DoubleType())),
+    ride_rows,
+    "Monthly ridership, service supplied, fare evasion and on-time performance by agency, Oct 2023 - Sep 2026. Grain: one row per agency per month.",
+    {"agency_id": "Agency (joins transit_agencies.agency_id).",
+     "month": "Reporting month (first day of month).",
+     "total_trips": "Total unlinked passenger trips (boardings/entries) in the month. This is 'ridership'.",
+     "avg_weekday_trips": "Average weekday ridership for the month.",
+     "revenue_vehicle_miles": "Vehicle (car/bus/vessel) revenue miles operated.",
+     "revenue_vehicle_hours": "Vehicle revenue hours operated.",
+     "public_subsidy_per_trip_usd": "Public operating support (dedicated taxes + subsidies + federal) per trip, in DOLLARS (not millions).",
+     "est_fare_evasion_rate": "Estimated share of trips taken without paying, 0-1.",
+     "on_time_performance_pct": "Percent of trips arriving on time per agency standard, 0-100."},
+)
+
+# COMMAND ----------
+
+# ---- cbd_toll_program (congestion pricing, launched Jan 5 2025) ----
+cbd_rows = []
+for i, month in enumerate([m for m in MONTHS if m >= dt.date(2025, 1, 1)]):
+    days = (month.replace(year=month.year + (month.month == 12), month=month.month % 12 + 1) - month).days
+    if month == dt.date(2025, 1, 1):
+        days = 27
+    daily = int(rng.uniform(545_000, 585_000) * (1 - 0.04 * (month.month in (7, 8))))
+    entries = daily * days
+    gross = round(entries * rng.uniform(2.75, 3.05) / 1_000_000, 2)  # blended per-entry revenue after once-a-day cap, crossing credits, off-peak
+    cost = round(gross * rng.uniform(0.08, 0.11), 2)
+    cbd_rows.append((month, entries, daily, 9.00, gross, cost, round(gross - cost, 2),
+                     round(rng.uniform(9.5, 12.5), 1)))
+build_table(
+    f"{CATALOG}.{SCHEMA_TRANSIT}.cbd_toll_program",
+    _schema(("month", DateType()), ("vehicle_entries", LongType()), ("avg_daily_entries", LongType()),
+            ("peak_passenger_toll_usd", DoubleType()), ("gross_toll_revenue_m", DoubleType()),
+            ("program_cost_m", DoubleType()), ("net_revenue_m", DoubleType()),
+            ("traffic_reduction_pct", DoubleType())),
+    cbd_rows,
+    "Central Business District Tolling Program (congestion pricing, Manhattan south of 60th St, launched Jan 5 2025). Grain: one row per month. RULE: Net revenue is lockboxed for the MTA capital program, NOT operating budgets.",
+    {"month": "Reporting month (first day of month).",
+     "vehicle_entries": "Vehicle entries into the CBD tolling zone during the month.",
+     "avg_daily_entries": "Average daily vehicle entries.",
+     "peak_passenger_toll_usd": "Peak-period E-ZPass toll for passenger vehicles, USD.",
+     "gross_toll_revenue_m": "Gross toll revenue, $M.",
+     "program_cost_m": "Collection and operating cost of the tolling program, $M.",
+     "net_revenue_m": "Net revenue available to the capital program, $M.",
+     "traffic_reduction_pct": "Estimated reduction in zone vehicle entries versus the pre-tolling baseline, percent."},
+)
+
+# ---- funding_sources (FY2026 budget) ----
+FUNDING = [
+    ("Passenger fares", "Operating", 6550.0),
+    ("Bridge & tunnel tolls (MTA B&T)", "Operating", 2650.0),
+    ("Payroll Mobility Tax", "Operating", 3350.0),
+    ("MMTOA (Metro Mass Transportation Operating Assistance)", "Operating", 2700.0),
+    ("Petroleum Business Tax", "Operating", 640.0),
+    ("Mortgage recording & real estate transfer taxes", "Operating", 820.0),
+    ("State & City subsidies (incl. paratransit reimbursement)", "Operating", 1450.0),
+    ("Federal operating assistance (FTA)", "Operating", 410.0),
+    ("Other operating revenue", "Operating", 780.0),
+    ("Congestion pricing (CBD tolling) - capital lockbox", "Capital", 560.0),
+    ("Federal capital grants", "Capital", 2900.0),
+    ("State & City capital contributions", "Capital", 1600.0),
+    ("MTA bonds", "Capital", 3400.0),
+]
+total_f = sum(a for _, _, a in FUNDING)
+build_table(
+    f"{CATALOG}.{SCHEMA_TRANSIT}.funding_sources",
+    _schema(("funding_source", StringType()), ("budget_type", StringType()), ("fiscal_year", IntegerType()),
+            ("amount_m", DoubleType()), ("pct_of_total", DoubleType())),
+    [(s, b, 2026, a, round(a / total_f * 100, 1)) for s, b, a in FUNDING],
+    "Budgeted FY2026 transit funding by source, split into Operating vs Capital, millions USD. Grain: one row per funding source.",
+    {"funding_source": "Funding source name.",
+     "budget_type": "Operating (pays for day-to-day service) or Capital (pays for infrastructure projects).",
+     "fiscal_year": "Fiscal year of the budget.",
+     "amount_m": "Budgeted amount, $M.",
+     "pct_of_total": "Share of total (operating + capital) funding, percent."},
+)
+
+# COMMAND ----------
+
+# ---- capital_projects ----
+MARQUEE = [
+    ("Second Avenue Subway Phase 2 (East Harlem)", "NYCT-SUB", "Network Expansion", "Manhattan", 7700, "Under Construction", 2032),
+    ("Penn Station Access (Metro-North to East Bronx)", "MNR", "Network Expansion", "Bronx", 2870, "Under Construction", 2027),
+    ("Interborough Express (Brooklyn-Queens light rail)", "NYCT-SUB", "Network Expansion", "Brooklyn", 5500, "Planning", 2032),
+    ("CBTC signal modernization - Fulton St A/C line", "NYCT-SUB", "Signal Modernization (CBTC)", "Brooklyn", 1100, "Under Construction", 2028),
+    ("CBTC signal modernization - Crosstown G line", "NYCT-SUB", "Signal Modernization (CBTC)", "Queens", 650, "Under Construction", 2027),
+    ("Zero-emission bus fleet - 500 battery-electric buses", "NYCT-BUS", "Fleet Replacement / Electrification", "Citywide", 1200, "Under Construction", 2029),
+    ("R262 subway car procurement", "NYCT-SUB", "Fleet Replacement / Electrification", "Citywide", 3000, "Design", 2031),
+    ("Staten Island Ferry - new Ollis-class vessels", "SIF", "Fleet Replacement / Electrification", "Staten Island", 330, "Complete", 2025),
+]
+CAP_CATS = ["State of Good Repair", "Station Accessibility (ADA)", "Signal Modernization (CBTC)",
+            "Fleet Replacement / Electrification", "Resiliency & Flood Protection", "Track & Structure"]
+CAP_FUND = ["Congestion pricing lockbox", "Federal grant", "MTA bonds", "State of NY", "City of NY"]
+STATUSES = ["Planning", "Design", "Under Construction", "Under Construction", "Under Construction", "Complete"]
+cap_rows = []
+for i, (pname, aid, cat, boro, budget, status, yr) in enumerate(MARQUEE):
+    pct = {"Planning": 0.03, "Design": 0.12, "Under Construction": rng.uniform(0.25, 0.7), "Complete": 1.0}[status]
+    cap_rows.append((f"CP-{3000 + i}", aid, pname, cat, boro, float(budget), round(budget * pct, 1),
+                     status, rng.choice(CAP_FUND[:3]), round(rng.uniform(0.3, 0.55), 2), yr))
+mta_rail_bus = [a[0] for a in AGENCIES if a[2] == "MTA"]
+for i in range(len(MARQUEE), 110):
+    aid = rng.choices(mta_rail_bus, weights=[40, 14, 6, 3, 14, 14, 2])[0]
+    cat = rng.choice(CAP_CATS)
+    boro = "Regional" if aid in ("LIRR", "MNR") else ("Staten Island" if aid == "SIR" else rng.choice(BOROUGHS))
+    noun = {"State of Good Repair": rng.choice(["station rehabilitation", "escalator replacement", "bus depot rehabilitation", "yard rehabilitation"]),
+            "Station Accessibility (ADA)": rng.choice(["new elevators", "accessible station upgrade", "platform edge & elevators"]),
+            "Signal Modernization (CBTC)": rng.choice(["interlocking replacement", "CBTC segment", "signal power upgrade"]),
+            "Fleet Replacement / Electrification": rng.choice(["electric bus charging depot", "railcar overhaul", "paratransit vehicle replacement"]),
+            "Resiliency & Flood Protection": rng.choice(["flood mitigation", "pump room upgrade", "coastal storm hardening"]),
+            "Track & Structure": rng.choice(["track replacement", "elevated structure repair", "tunnel lighting"])}[cat]
+    budget = round(rng.uniform(8, 450), 1)
+    status = rng.choice(STATUSES)
+    pct = {"Planning": rng.uniform(0, 0.05), "Design": rng.uniform(0.04, 0.2),
+           "Under Construction": rng.uniform(0.2, 0.95), "Complete": rng.uniform(0.96, 1.12)}[status]
+    cap_rows.append((f"CP-{3000 + i}", aid, f"{boro} {noun}".replace("Regional ", f"{aid} "), cat, boro, budget,
+                     round(budget * pct, 1), status, rng.choice(CAP_FUND), round(rng.uniform(0.0, 0.8), 2),
+                     rng.choice([2026, 2027, 2028, 2029, 2030]) if status != "Complete" else rng.choice([2024, 2025, 2026])))
+build_table(
+    f"{CATALOG}.{SCHEMA_TRANSIT}.capital_projects",
+    _schema(("project_id", StringType()), ("agency_id", StringType()), ("project_name", StringType()),
+            ("category", StringType()), ("borough", StringType()), ("budget_m", DoubleType()),
+            ("spent_to_date_m", DoubleType()), ("status", StringType()), ("primary_funding_source", StringType()),
+            ("federal_share", DoubleType()), ("planned_completion_year", IntegerType())),
+    cap_rows,
+    "Transit capital-program projects (2025-2029 Capital Program style) with budget, spend-to-date, funding and status. Grain: one row per project.",
+    {"project_id": "Capital project identifier.",
+     "agency_id": "Sponsoring agency (joins transit_agencies.agency_id).",
+     "project_name": "Project description.",
+     "category": "Investment category, e.g. State of Good Repair, Station Accessibility (ADA), Signal Modernization (CBTC).",
+     "borough": "Borough of the project; Citywide or Regional when it spans many.",
+     "budget_m": "Total project budget, $M.",
+     "spent_to_date_m": "Amount spent to date, $M. Can exceed budget_m (cost overrun).",
+     "status": "Lifecycle status: Planning, Design, Under Construction, Complete.",
+     "primary_funding_source": "Main funding source for the project.",
+     "federal_share": "Federal share of project cost, 0-1.",
+     "planned_completion_year": "Planned (or actual, if Complete) completion year."},
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3 · NYC DEP Water & Sewer  (`nyc_dep_water`)
+# MAGIC
+# MAGIC The NYC Department of Environmental Protection and NYC Water Board view: customer accounts and monthly
+# MAGIC billing with arrears, rate schedules by fiscal year (**NYC fiscal year runs July 1 – June 30**), water main
+# MAGIC breaks, DEP 311 service requests, upstate reservoir storage, assistance programs and infrastructure assets.
+
+# COMMAND ----------
+
+rng = random.Random(MASTER_SEED + 3)
+
+# ---- rate_schedules (FY2026 and FY2027) ----
+FY26_WATER = 4.95
+RATE_CLASSES = [
+    ("R1", "1-3 Family Residential", "Metered"),
+    ("MF", "Multifamily (Metered)", "Metered"),
+    ("MCP", "Multifamily Conservation Program", "Flat per unit"),
+    ("CM", "Commercial", "Metered"),
+    ("IN", "Industrial", "Metered"),
+]
+rate_rows, RATE = [], {}
+for fy, mult in ((2026, 1.0), (2027, 1.085)):
+    for code, cls, basis in RATE_CLASSES:
+        water = round(FY26_WATER * mult, 2)
+        flat = round(1203 * mult, 2) if code == "MCP" else None
+        min_day = round(0.53 * mult, 2)
+        RATE[(code, fy)] = (water, 1.59, min_day, flat)
+        rate_rows.append((code, fy, cls, basis, water, 1.59, min_day, flat,
+                          dt.date(fy - 1, 7, 1)))
+build_table(
+    f"{CATALOG}.{SCHEMA_WATER}.rate_schedules",
+    _schema(("rate_code", StringType()), ("fiscal_year", IntegerType()), ("customer_class", StringType()),
+            ("billing_basis", StringType()), ("water_rate_per_ccf", DoubleType()), ("sewer_pct_of_water", DoubleType()),
+            ("min_charge_per_day_usd", DoubleType()), ("flat_annual_per_unit_usd", DoubleType()),
+            ("effective_date", DateType())),
+    rate_rows,
+    "NYC Water Board rate schedules by customer class and fiscal year (FY runs Jul 1 - Jun 30; FY2027 began 2026-07-01). Grain: one row per rate_code per fiscal year. RULE: Joins must match both rate_code and fiscal_year.",
+    {"rate_code": "Rate code (joins water_accounts.rate_code). R1, MF, MCP, CM, IN.",
+     "fiscal_year": "NYC fiscal year the rate applies to (FY2026 = Jul 2025 - Jun 2026).",
+     "customer_class": "Customer class description.",
+     "billing_basis": "Metered (charged per ccf) or Flat per unit (Multifamily Conservation Program).",
+     "water_rate_per_ccf": "Water charge in USD per ccf (100 cubic feet = 748 gallons).",
+     "sewer_pct_of_water": "Sewer charge as a multiple of the water charge (1.59 = 159%).",
+     "min_charge_per_day_usd": "Minimum daily service charge, USD.",
+     "flat_annual_per_unit_usd": "Annual flat charge per dwelling unit for MCP accounts, USD; null for metered classes.",
+     "effective_date": "Date the rate took effect."},
+)
+
+# COMMAND ----------
+
+# ---- water_accounts + monthly_billing (Jul 2025 - Sep 2026: all of FY2026 + first quarter of FY2027) ----
+N_ACCTS = 6000
+CLASS_W_BY_BORO = {  # R1, MF, MCP, CM, IN
+    "Manhattan": [4, 46, 18, 30, 2],
+    "Bronx": [30, 40, 15, 12, 3],
+    "Brooklyn": [52, 26, 8, 11, 3],
+    "Queens": [64, 18, 5, 10, 3],
+    "Staten Island": [82, 6, 2, 8, 2],
+}
+BASE_CCF = {"R1": 7.0, "MF": 3.4, "MCP": 3.4, "CM": 45.0, "IN": 380.0}  # MF/MCP per dwelling unit
+BILL_MONTHS = [dt.date(2025, m, 1) for m in range(7, 13)] + [dt.date(2026, m, 1) for m in range(1, 10)]
+ASSIST = ["Home Water Assistance Program (HWAP)", "Multifamily Water Assistance Program (MWAP)",
+          "Water Debt Assistance Program (WDAP)"]
+
+
+def fiscal_year(d):
+    return d.year + 1 if d.month >= 7 else d.year
+
+
+acct_cds = weighted_cds(rng, N_ACCTS)
+accounts, bill_rows = [], []
+for i in range(N_ACCTS):
+    code, _, boro, _ = acct_cds[i]
+    rate_code = rng.choices([r[0] for r in RATE_CLASSES], weights=CLASS_W_BY_BORO[boro])[0]
+    units = 1 if rate_code in ("CM", "IN") else (rng.randint(1, 3) if rate_code == "R1" else rng.randint(6, 240))
+    program = None
+    if rate_code == "R1" and rng.random() < 0.09:
+        program = rng.choices([ASSIST[0], ASSIST[2]], weights=[80, 20])[0]
+    elif rate_code in ("MF", "MCP") and rng.random() < 0.07:
+        program = ASSIST[1]
+    acct_id = f"W{4000000 + i}"
+    pay_p = {"R1": 0.91, "MF": 0.84, "MCP": 0.86, "CM": 0.90, "IN": 0.93}[rate_code] - (0.10 if program else 0)
+    habitual = rng.random() < 0.08  # chronic non-payers
+    arrears, months_behind = 0.0, 0
+    for month in BILL_MONTHS:
+        fy = fiscal_year(month)
+        water_rate, sewer_mult, min_day, flat = RATE[(rate_code, fy)]
+        season = 1.0 + 0.18 * (month.month in (6, 7, 8)) - 0.05 * (month.month in (1, 2))
+        ccf = round(BASE_CCF[rate_code] * (units if rate_code in ("MF", "MCP") else 1) * season * rng.uniform(0.8, 1.2), 2)
+        if rate_code == "MCP":
+            water_chg = round(flat * units / 12 / (1 + sewer_mult), 2)
+        else:
+            water_chg = round(max(ccf * water_rate, min_day * 30), 2)
+        sewer_chg = round(water_chg * sewer_mult, 2)
+        billed = round(water_chg + sewer_chg, 2)
+        if habitual:
+            paid = round(billed * rng.uniform(0.0, 0.3), 2)
+        elif rng.random() < pay_p:
+            paid = round(billed + (min(arrears, billed) if rng.random() < 0.35 else 0), 2)
+        else:
+            paid = round(billed * rng.uniform(0.0, 0.6), 2)
+        arrears = round(max(0.0, arrears + billed - paid), 2)
+        months_behind = months_behind + 1 if arrears > 0 else 0
+        bill_rows.append((acct_id, month, fy, ccf, water_chg, sewer_chg, billed, paid, arrears, months_behind * 30))
+    if arrears > 1000 and months_behind >= 12:
+        status = "Lien-Eligible"
+    elif arrears > 0 and rng.random() < 0.25:
+        status = "Payment Agreement"
+    else:
+        status = rng.choices(["Active", "Closed"], weights=[97, 3])[0]
+    accounts.append((acct_id, code, boro, rate_code, units, program is not None, program, status,
+                     rng.choices(["AMR smart meter", "Legacy meter"], weights=[95, 5])[0], rng.randint(1, 360)))
+
+build_table(
+    f"{CATALOG}.{SCHEMA_WATER}.water_accounts",
+    _schema(("account_id", StringType()), ("community_district", StringType()), ("borough", StringType()),
+            ("rate_code", StringType()), ("dwelling_units", IntegerType()), ("enrolled_in_assistance", BooleanType()),
+            ("assistance_program", StringType()), ("account_status", StringType()), ("meter_type", StringType()),
+            ("tenure_months", IntegerType())),
+    accounts,
+    "NYC DEP water & sewer customer accounts (one per billed property) with rate class, dwelling units, assistance enrollment and collections status. Grain: one row per account.",
+    {"account_id": "Unique water/sewer account identifier.",
+     "community_district": "Community district of the property (joins community_districts.community_district).",
+     "borough": "Borough of the property.",
+     "rate_code": "Rate class (joins rate_schedules.rate_code). R1 = 1-3 family, MF = multifamily metered, MCP = Multifamily Conservation Program (flat), CM = commercial, IN = industrial.",
+     "dwelling_units": "Residential units on the account (1 for commercial/industrial).",
+     "enrolled_in_assistance": "TRUE if enrolled in a water affordability program.",
+     "assistance_program": "Assistance program name (HWAP, MWAP or WDAP); null if none.",
+     "account_status": "Collections status: Active, Payment Agreement, Lien-Eligible (large balance overdue 12+ months), or Closed.",
+     "meter_type": "AMR smart meter (automated reads) or Legacy meter.",
+     "tenure_months": "Months the current owner has held the account."},
+)
+build_table(
+    f"{CATALOG}.{SCHEMA_WATER}.monthly_billing",
+    _schema(("account_id", StringType()), ("bill_month", DateType()), ("fiscal_year", IntegerType()),
+            ("consumption_ccf", DoubleType()), ("water_charge_usd", DoubleType()), ("sewer_charge_usd", DoubleType()),
+            ("billed_amount_usd", DoubleType()), ("paid_amount_usd", DoubleType()),
+            ("arrears_balance_usd", DoubleType()), ("days_past_due", IntegerType())),
+    bill_rows,
+    "Monthly water & sewer bills per account, Jul 2025 - Sep 2026. Grain: one row per account per month. RULE: arrears_balance_usd is a RUNNING balance (a snapshot), so never SUM it across months - filter to a single bill_month (usually the latest).",
+    {"account_id": "Account billed (joins water_accounts.account_id).",
+     "bill_month": "Billing month (first day of month).",
+     "fiscal_year": "NYC fiscal year of the bill (Jul-Jun; bill_month 2026-07-01 is FY2027).",
+     "consumption_ccf": "Metered water use in ccf (100 cubic feet = 748 gallons).",
+     "water_charge_usd": "Water portion of the bill, USD.",
+     "sewer_charge_usd": "Sewer portion of the bill (159% of water), USD.",
+     "billed_amount_usd": "Total billed for the month (water + sewer), USD.",
+     "paid_amount_usd": "Payments received against the account in the month, USD.",
+     "arrears_balance_usd": "Unpaid balance on the account after this month's bill and payment, USD.",
+     "days_past_due": "Days the account has carried an unpaid balance (0 = current)."},
+)
+
+# COMMAND ----------
+
+# ---- water_main_breaks (Jan 2023 - Sep 2026) ----
+BORO_MAIN_W = {"Queens": 32, "Brooklyn": 26, "Bronx": 13, "Manhattan": 13, "Staten Island": 16}
+MONTH_W = {1: 2.3, 2: 2.0, 3: 1.3, 4: 0.8, 5: 0.7, 6: 0.7, 7: 0.8, 8: 0.8, 9: 0.7, 10: 0.8, 11: 1.0, 12: 1.7}
+CAUSES = ["Temperature Change / Frost", "Corrosion", "Pipe Age / Fatigue", "Construction Damage",
+          "Pressure Transient", "Unknown"]
+brk_months = [m for m in [dt.date(y, mm, 1) for y in (2023, 2024, 2025, 2026) for mm in range(1, 13)]
+              if m <= dt.date(2026, 9, 1)]
+brk_rows = []
+for i in range(1450):
+    month = rng.choices(brk_months, weights=[MONTH_W[m.month] for m in brk_months])[0]
+    bdate = month + dt.timedelta(days=rng.randint(0, 27))
+    boro = rng.choices(list(BORO_MAIN_W), weights=list(BORO_MAIN_W.values()))[0]
+    code = weighted_cds(rng, 1, boro)[0][0]
+    install = int(rng.triangular(1870, 2015, 1925))
+    material = ("Unlined Cast Iron" if install < 1930 else
+                "Lined Cast Iron" if install < 1970 else
+                rng.choice(["Ductile Iron", "Ductile Iron", "Steel"]))
+    diameter = rng.choices([6, 8, 12, 16, 20, 24, 36, 48], weights=[22, 30, 24, 9, 6, 5, 3, 1])[0]
+    cause = rng.choices(CAUSES, weights=[34 if month.month in (12, 1, 2) else 8, 20, 22, 9, 6, 9])[0]
+    hours = round(rng.uniform(2, 10) * (1 + diameter / 24), 1)
+    affected = int(rng.uniform(10, 120) * diameter / 8) if rng.random() < 0.8 else 0
+    brk_rows.append((f"BRK-{60000 + i}", bdate, boro, code, diameter, material, install, cause,
+                     affected, hours, diameter >= 20 or rng.random() < 0.35,
+                     round(rng.uniform(18_000, 60_000) * (1 + diameter / 12), 0)))
+build_table(
+    f"{CATALOG}.{SCHEMA_WATER}.water_main_breaks",
+    _schema(("break_id", StringType()), ("break_date", DateType()), ("borough", StringType()),
+            ("community_district", StringType()), ("main_diameter_in", IntegerType()), ("pipe_material", StringType()),
+            ("install_year", IntegerType()), ("cause", StringType()), ("customers_without_water", IntegerType()),
+            ("hours_out_of_service", DoubleType()), ("street_closed", BooleanType()), ("repair_cost_usd", DoubleType())),
+    brk_rows,
+    "Water main break events, Jan 2023 - Sep 2026. Breaks spike in winter (freeze-thaw). Grain: one row per break.",
+    {"break_id": "Unique break identifier.",
+     "break_date": "Date the break was reported.",
+     "borough": "Borough of the break.",
+     "community_district": "Community district of the break (joins community_districts.community_district).",
+     "main_diameter_in": "Diameter of the broken main, inches (20 inch and above = trunk main).",
+     "pipe_material": "Pipe material: Unlined Cast Iron, Lined Cast Iron, Ductile Iron, Steel.",
+     "install_year": "Year the main was installed.",
+     "cause": "Primary cause category.",
+     "customers_without_water": "Service connections that lost water during repair.",
+     "hours_out_of_service": "Hours until the main was returned to service.",
+     "street_closed": "TRUE if a street closure was required.",
+     "repair_cost_usd": "Estimated repair cost, USD."},
+)
+
+# COMMAND ----------
+
+# ---- service_requests_311 (DEP, Jan 2025 - Sep 2026) ----
+SR_TYPES = [  # (complaint_type, descriptor, weight, median days to close)
+    ("Water System", "No Water", 14, 0.6), ("Water System", "Low Water Pressure", 12, 4.0),
+    ("Water System", "Leak (Use Comments)", 16, 6.0), ("Water System", "Hydrant Running", 9, 1.5),
+    ("Water Quality", "Discolored / Dirty Water", 7, 2.0), ("Water Quality", "Taste / Odor", 3, 5.0),
+    ("Sewer", "Sewer Backup", 13, 1.2), ("Sewer", "Catch Basin Clogged / Flooding", 15, 7.0),
+    ("Sewer", "Street Flooding", 7, 3.0), ("Water Conservation", "Water Waste", 4, 12.0),
+]
+sr_start = dt.date(2025, 1, 1)
+sr_days = (dt.date(2026, 9, 30) - sr_start).days
+as_of = dt.date(2026, 9, 30)
+sr_rows = []
+for i in range(12000):
+    ctype, desc, _, med = rng.choices(SR_TYPES, weights=[t[2] for t in SR_TYPES])[0]
+    created = sr_start + dt.timedelta(days=rng.randint(0, sr_days))
+    # summer storms drive flooding / sewer complaints; winter drives no-water
+    if desc in ("Street Flooding", "Catch Basin Clogged / Flooding") and created.month not in (6, 7, 8, 9) and rng.random() < 0.5:
+        created = created.replace(month=rng.choice([7, 8]), day=min(created.day, 28))
+    code, _, boro, _ = weighted_cds(rng, 1)[0]
+    days = round(rng.lognormvariate(math.log(med), 0.8), 1)
+    closed = created + dt.timedelta(days=int(math.ceil(days)))
+    if closed > as_of:
+        status, closed_date, days_out = rng.choice(["Open", "In Progress"]), None, None
+    else:
+        status, closed_date, days_out = "Closed", closed, days
+    sr_rows.append((f"SR-{7100000 + i}", created, closed_date, ctype, desc, boro, code, status, days_out))
+build_table(
+    f"{CATALOG}.{SCHEMA_WATER}.service_requests_311",
+    _schema(("request_id", StringType()), ("created_date", DateType()), ("closed_date", DateType()),
+            ("complaint_type", StringType()), ("descriptor", StringType()), ("borough", StringType()),
+            ("community_district", StringType()), ("status", StringType()), ("days_to_close", DoubleType())),
+    sr_rows,
+    "311 service requests routed to DEP, Jan 2025 - Sep 2026. Grain: one row per service request.",
+    {"request_id": "311 service-request number.",
+     "created_date": "Date the request was created.",
+     "closed_date": "Date the request was closed; null if still open.",
+     "complaint_type": "311 complaint type: Water System, Water Quality, Sewer, Water Conservation.",
+     "descriptor": "Specific problem reported, e.g. No Water, Low Water Pressure, Sewer Backup, Catch Basin Clogged / Flooding.",
+     "borough": "Borough of the incident.",
+     "community_district": "Community district of the incident (joins community_districts.community_district).",
+     "status": "Request status: Open, In Progress, Closed.",
+     "days_to_close": "Days from creation to closure (null if not closed)."},
+)
+
+# COMMAND ----------
+
+# ---- reservoir_storage (daily, Jan 2024 - Sep 2026) ----
+SYSTEMS = [("Catskill", 140.0, 0.9), ("Delaware", 320.0, 1.0), ("Croton", 95.0, 1.35)]
+d0, d1 = dt.date(2024, 1, 1), dt.date(2026, 9, 30)
+drought_center = dt.date(2024, 11, 18)
+mild_center = dt.date(2026, 9, 5)
+res_rows = []
+noise = {s[0]: 0.0 for s in SYSTEMS}
+day = d0
+while day <= d1:
+    doy = day.timetuple().tm_yday
+    normal = 88 + 10 * math.cos(2 * math.pi * (doy - 130) / 365)
+    anomaly = (-24 * math.exp(-(((day - drought_center).days) / 45) ** 2)
+               - 7 * math.exp(-(((day - mild_center).days) / 35) ** 2))
+    precip = round(max(0.0, rng.gauss(0.12, 0.25)) if rng.random() < 0.35 else 0.0, 2)
+    for sysname, cap, vol in SYSTEMS:
+        noise[sysname] = 0.92 * noise[sysname] + rng.gauss(0, 0.6)
+        pct = max(35.0, min(100.0, normal + anomaly * vol + noise[sysname]))
+        res_rows.append((day, sysname, round(cap * pct / 100, 2), cap, round(pct, 1), round(normal, 1), precip))
+    day += dt.timedelta(days=1)
+
+res_df = spark.createDataFrame(res_rows, _schema(
+    ("reading_date", DateType()), ("reservoir_system", StringType()), ("storage_bg", DoubleType()),
+    ("capacity_bg", DoubleType()), ("pct_full", DoubleType()), ("normal_pct_full", DoubleType()),
+    ("precipitation_in", DoubleType())))
+sysw = res_df.groupBy("reading_date").agg(
+    (F.sum("storage_bg") / F.sum("capacity_bg") * 100 - F.first("normal_pct_full")).alias("dev"))
+res_df = (res_df.join(sysw, "reading_date")
+          .withColumn("drought_status", F.when(F.col("dev") < -18, "Drought Warning")
+                      .when(F.col("dev") < -10, "Drought Watch").otherwise("Normal"))
+          .drop("dev").orderBy("reading_date", "reservoir_system"))
+res_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"{CATALOG}.{SCHEMA_WATER}.reservoir_storage")
+add_comments(
+    f"{CATALOG}.{SCHEMA_WATER}.reservoir_storage",
+    "Daily storage in NYC's three upstate reservoir systems (Catskill, Delaware, Croton), Jan 2024 - Sep 2026, including the Fall 2024 drought. Grain: one row per system per day. RULE: For system-wide percent full, use SUM(storage_bg)/SUM(capacity_bg) for a single date - do not average pct_full.",
+    {"reading_date": "Date of the storage reading.",
+     "reservoir_system": "Reservoir system: Catskill, Delaware or Croton.",
+     "storage_bg": "Water in storage, billions of gallons.",
+     "capacity_bg": "Total storage capacity of the system, billions of gallons.",
+     "pct_full": "Storage as percent of capacity for this system, 0-100.",
+     "normal_pct_full": "Historical normal percent full for this day of year.",
+     "precipitation_in": "Watershed precipitation that day, inches (same value for all systems).",
+     "drought_status": "System-wide drought status on that date: Normal, Drought Watch or Drought Warning."},
+)
+print(f"  ✓ {CATALOG}.{SCHEMA_WATER}.reservoir_storage  ({len(res_rows):,} rows)")
+
+# COMMAND ----------
+
+# ---- assistance_programs ----
+PROGRAMS_W = [
+    ("Home Water Assistance Program (HWAP)", "1-3 family homeowners eligible for HEAP, SNAP or SSI", 54_000, 135, 7.3),
+    ("Multifamily Water Assistance Program (MWAP)", "Affordable multifamily buildings with regulatory agreements", 1_900, 26_000, 49.4),
+    ("Water Debt Assistance Program (WDAP)", "Homeowners with high water debt at risk of lien sale", 2_300, 2_150, 4.9),
+    ("Leak Forgiveness Program", "Accounts with a repaired leak", 6_800, 640, 4.4),
+    ("Senior & Disabled Water Credit", "Owner-occupants 65+ or disabled with income limit", 21_000, 95, 2.0),
+    ("Payment Agreement (installment plan)", "Any account with arrears", 38_000, 0, 0.0),
+]
+build_table(
+    f"{CATALOG}.{SCHEMA_WATER}.assistance_programs",
+    _schema(("program_name", StringType()), ("eligibility", StringType()), ("accounts_enrolled", IntegerType()),
+            ("avg_annual_credit_usd", IntegerType()), ("total_credits_m", DoubleType()), ("funds_utilized_pct", DoubleType())),
+    [(n, e, a, c, t, round(rng.uniform(64, 96), 1) if t else None) for n, e, a, c, t in PROGRAMS_W],
+    "NYC Water Board / DEP affordability and arrears-relief programs (FY2026). Grain: one row per program.",
+    {"program_name": "Program name.",
+     "eligibility": "Who qualifies.",
+     "accounts_enrolled": "Accounts enrolled or benefiting citywide.",
+     "avg_annual_credit_usd": "Average annual bill credit per account, USD (0 for installment plans).",
+     "total_credits_m": "Total credits issued, $M.",
+     "funds_utilized_pct": "Percent of allocated program funds used, 0-100; null for programs without a fund."},
+)
+
+# ---- infrastructure_assets ----
+ASSET_TYPES = [  # (type, weight, cost range $M)
+    ("Water Main Segment", 30, (0.4, 6)), ("Sewer Segment", 26, (0.5, 8)), ("Catch Basin", 18, (0.01, 0.05)),
+    ("Fire Hydrant", 14, (0.008, 0.02)), ("Pumping Station", 4, (8, 60)), ("CSO Regulator / Outfall", 5, (2, 25)),
+    ("Wastewater Resource Recovery Facility", 1, (400, 1800)), ("Shaft / Valve Chamber", 2, (5, 40)),
+]
+COND = ["Good", "Fair", "Poor", "Critical"]
+asset_rows = []
+for i in range(1000):
+    atype, _, (lo, hi) = rng.choices(ASSET_TYPES, weights=[a[1] for a in ASSET_TYPES])[0]
+    code, _, boro, _ = weighted_cds(rng, 1)[0]
+    install = int(rng.triangular(1880, 2024, 1950))
+    age = 2026 - install
+    cond = rng.choices(COND, weights=[max(5, 60 - age // 2), 30, 8 + age // 8, 2 + age // 20])[0]
+    asset_rows.append((f"AST-{90000 + i}", atype, boro, code, install, age, cond,
+                       rng.randint(1, 5), round(rng.uniform(lo, hi), 3),
+                       dt.date(2023, 1, 1) + dt.timedelta(days=rng.randint(0, 1360))))
+build_table(
+    f"{CATALOG}.{SCHEMA_WATER}.infrastructure_assets",
+    _schema(("asset_id", StringType()), ("asset_type", StringType()), ("borough", StringType()),
+            ("community_district", StringType()), ("install_year", IntegerType()), ("age_years", IntegerType()),
+            ("condition", StringType()), ("criticality", IntegerType()), ("replacement_cost_m", DoubleType()),
+            ("last_inspection_date", DateType())),
+    asset_rows,
+    "Sample inventory of DEP water, sewer and wastewater assets with age, condition, criticality and replacement cost. Grain: one row per asset.",
+    {"asset_id": "Unique asset identifier.",
+     "asset_type": "Asset type, e.g. Water Main Segment, Sewer Segment, Catch Basin, Pumping Station, CSO Regulator / Outfall.",
+     "borough": "Borough of the asset.",
+     "community_district": "Community district (joins community_districts.community_district).",
+     "install_year": "Year installed.",
+     "age_years": "Age in years as of 2026.",
+     "condition": "Latest assessed condition: Good, Fair, Poor, Critical.",
+     "criticality": "Consequence-of-failure rating 1-5 (5 = most critical).",
+     "replacement_cost_m": "Estimated replacement cost, $M.",
+     "last_inspection_date": "Date of the most recent inspection."},
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4 · NYC DOHMH Food Safety & Rodent Control  (`nyc_dohmh_food_safety`)
+# MAGIC
+# MAGIC The NYC Department of Health and Mental Hygiene view of **restaurant inspections** (letter grading: an initial
+# MAGIC inspection scoring 0-13 earns an A; otherwise the restaurant is re-inspected and graded A/B/C on that score),
+# MAGIC cited **violations**, DOHMH **closures**, and **rodent inspections** including the City's Rat Mitigation Zones.
+
+# COMMAND ----------
+
+rng = random.Random(MASTER_SEED + 4)
+
+# ---- violation_codes (code, description, category, base points) ----
+VIOLATION_CODES = [
+    ("02B", "Hot TCS food item not held at or above 140 F", "Critical", 7),
+    ("02G", "Cold TCS food item held above 41 F", "Critical", 7),
+    ("04A", "Food Protection Certificate not held by manager or supervisor", "Critical", 5),
+    ("04H", "Raw, cooked or prepared food is adulterated or contaminated", "Public Health Hazard", 10),
+    ("04L", "Evidence of mice or live mice in establishment", "Public Health Hazard", 10),
+    ("04M", "Live roaches in food or non-food area", "Public Health Hazard", 10),
+    ("04N", "Filth flies or food/refuse/sewage-associated flies present", "Critical", 5),
+    ("05D", "Hand washing facility not provided or not accessible", "Critical", 7),
+    ("06C", "Food not protected from potential source of contamination", "Critical", 5),
+    ("06D", "Food contact surface not properly washed, rinsed and sanitized", "Critical", 5),
+    ("06E", "Sanitized equipment or utensil improperly used or stored", "Critical", 5),
+    ("08A", "Conditions conducive to rodents or insects (harborage)", "General", 4),
+    ("08C", "Pesticide use not in accordance with label", "General", 3),
+    ("09C", "Food contact surface not properly maintained", "General", 3),
+    ("10B", "Plumbing not properly installed or maintained", "General", 3),
+    ("10F", "Non-food contact surface improperly constructed or maintained", "General", 2),
+    ("10H", "Proper sanitization not provided for utensil ware washing", "General", 3),
+    ("10J", "Hand wash sign not posted", "General", 2),
+]
+VC_WEIGHTS = [8, 7, 6, 2, 6, 3, 5, 3, 9, 6, 5, 9, 1, 6, 5, 12, 4, 3]
+build_table(
+    f"{CATALOG}.{SCHEMA_HEALTH}.violation_codes",
+    _schema(("violation_code", StringType()), ("description", StringType()), ("category", StringType()),
+            ("is_critical", BooleanType()), ("base_points", IntegerType())),
+    [(c, d, cat, cat != "General", pts) for c, d, cat, pts in VIOLATION_CODES],
+    "Reference list of DOHMH food-safety violation codes. Grain: one row per violation code.",
+    {"violation_code": "Violation code (joins violations.violation_code).",
+     "description": "Plain-language description of the violation.",
+     "category": "Severity category: Public Health Hazard, Critical, or General.",
+     "is_critical": "TRUE for Critical and Public Health Hazard violations (DOHMH 'critical flag').",
+     "base_points": "Minimum points the violation adds to an inspection score."},
+)
+
+# ---- restaurants ----
+CUISINES = [("American", 19), ("Chinese", 10), ("Coffee/Tea", 8), ("Pizza", 8), ("Mexican", 5), ("Italian", 5),
+            ("Latin American", 4), ("Caribbean", 4), ("Japanese", 4), ("Bakery Products/Desserts", 4), ("Chicken", 3),
+            ("Spanish", 3), ("Donuts", 2), ("Indian", 2), ("Jewish/Kosher", 2), ("Korean", 2), ("Thai", 2),
+            ("Sandwiches", 2), ("Mediterranean", 2), ("Juice, Smoothies, Fruit Salads", 2), ("Hamburgers", 2),
+            ("Asian/Asian Fusion", 2), ("French", 1), ("Middle Eastern", 1)]
+NAME_A = ["Golden", "Lucky", "Empire", "Liberty", "Hudson", "Village", "Corner", "Little", "Royal", "Sunrise", "Metro",
+          "Broadway", "Lotus", "Casa", "Uptown", "Grand", "Avenue", "Harbor", "Bridge", "Park", "Station", "Garden",
+          "Blue", "Red", "Green", "Union", "Bay", "Hill", "River", "Market"]
+NAME_B = ["Kitchen", "Deli", "Cafe", "Grill", "Diner", "Bistro", "Express", "House", "Palace", "Spot", "Eatery",
+          "Bakery", "Pizzeria", "Taqueria", "Noodle Bar", "Coffee", "Bagels", "Tavern", "Restaurant", "Cantina"]
+CHAINS = [("Five Boro Bagels", "Bakery Products/Desserts"), ("Metro Coffee Co.", "Coffee/Tea"), ("Big Apple Slice", "Pizza"),
+          ("Liberty Chicken", "Chicken"), ("Hudson Burger Bar", "Hamburgers"), ("Sunrise Donuts", "Donuts")]
+N_REST = 6000
+REST_START, REST_END = dt.date(2024, 1, 1), dt.date(2026, 9, 30)
+rest_cds = rng.choices(NYC_CDS, weights=[c[3] * (2.6 if c[2] == "Manhattan" else 1.0) for c in NYC_CDS], k=N_REST)
+restaurants, risk = [], {}
+for i in range(N_REST):
+    code, _, boro, _ = rest_cds[i]
+    chain = rng.random() < 0.09
+    if chain:
+        name, cuisine = rng.choice(CHAINS)
+    else:
+        cuisine = rng.choices([c[0] for c in CUISINES], weights=[c[1] for c in CUISINES])[0]
+        name = f"{rng.choice(NAME_A)} {rng.choice(NAME_B)}"
+    if rng.random() < 0.85:
+        opened = dt.date(2005, 1, 1) + dt.timedelta(days=rng.randint(0, 6938))  # through 2023
+    else:
+        opened = REST_START + dt.timedelta(days=rng.randint(0, 900))
+    camis = f"{50000000 + i}"
+    risk[camis] = rng.lognormvariate(0, 0.45) * (0.8 if chain else 1.0)
+    restaurants.append((camis, name, boro, code, cuisine, bool(chain), opened,
+                        rng.choices(["Active", "Out of Business"], weights=[95, 5])[0]))
+build_table(
+    f"{CATALOG}.{SCHEMA_HEALTH}.restaurants",
+    _schema(("camis", StringType()), ("dba", StringType()), ("borough", StringType()), ("community_district", StringType()),
+            ("cuisine", StringType()), ("is_chain", BooleanType()), ("permit_start_date", DateType()), ("status", StringType())),
+    restaurants,
+    "Food service establishments permitted by DOHMH. Names are synthetic. Grain: one row per restaurant (CAMIS).",
+    {"camis": "DOHMH restaurant identifier (CAMIS). Joins inspections.camis.",
+     "dba": "Doing-business-as (restaurant) name. Synthetic.",
+     "borough": "Borough of the restaurant.",
+     "community_district": "Community district (joins community_districts.community_district).",
+     "cuisine": "Cuisine description.",
+     "is_chain": "TRUE if the restaurant belongs to a multi-location chain.",
+     "permit_start_date": "Date the restaurant's food service permit started.",
+     "status": "Active or Out of Business."},
+)
+
+# COMMAND ----------
+
+# ---- inspections + violations (Jan 2024 - Sep 2026) ----
+ACT_CITED = "Violations were cited in the following area(s)."
+ACT_NONE = "No violations were recorded at the time of this inspection."
+ACT_CLOSED = "Establishment Closed by DOHMH. Violations were cited in the following area(s) and those requiring immediate action were addressed."
+ACT_REOPEN = "Establishment re-opened by DOHMH."
+vc_by_code = {v[0]: v for v in VIOLATION_CODES}
+insp_rows, viol_rows = [], []
+iid = vid = 0
+
+
+def gen_violations(level):
+    n = max(0, int(round(rng.gauss(2.6 * level, 1.3))))
+    codes = list(dict.fromkeys(rng.choices([v[0] for v in VIOLATION_CODES], weights=VC_WEIGHTS, k=n)))
+    pts = [vc_by_code[c][3] + rng.randint(0, 1 if vc_by_code[c][2] == "General" else 2) for c in codes]
+    return list(zip(codes, pts))
+
+
+def add_inspection(camis, day, itype, viols, grade, action):
+    global iid, vid
+    inspection_id = f"I{7000000 + iid}"
+    iid += 1
+    score = sum(p for _, p in viols)
+    crit = sum(1 for c, _ in viols if vc_by_code[c][2] != "General")
+    insp_rows.append((inspection_id, camis, day, itype, score, grade,
+                      day if grade in ("A", "B", "C") else None, action, len(viols), crit))
+    for c, p in viols:
+        viol_rows.append((f"V{9000000 + vid}", inspection_id, camis, day, c, p))
+        vid += 1
+    return score
+
+
+def band(score):
+    return "A" if score <= 13 else ("B" if score <= 27 else "C")
+
+
+for camis, name, boro, code, cuisine, chain, opened, status in restaurants:
+    lvl = risk[camis]
+    pre = opened >= REST_START
+    day = (opened + dt.timedelta(days=rng.randint(7, 60))) if pre else (REST_START + dt.timedelta(days=rng.randint(0, 330)))
+    while day <= REST_END:
+        viols = gen_violations(lvl)
+        score = sum(p for _, p in viols)
+        closed = score >= 28 and any(vc_by_code[c][2] == "Public Health Hazard" for c, _ in viols) and rng.random() < 0.3
+        action = ACT_CLOSED if closed else (ACT_CITED if viols else ACT_NONE)
+        itype = "Pre-permit (Operational) / Initial Inspection" if pre else "Cycle Inspection / Initial Inspection"
+        add_inspection(camis, day, itype, viols, "A" if score <= 13 else "Not Yet Graded", action)
+        last, grade = day, "A"
+        if closed:
+            last = day + dt.timedelta(days=rng.randint(2, 10))
+            add_inspection(camis, last, "Cycle Inspection / Reopening Inspection", gen_violations(lvl * 0.3),
+                           "Grade Pending", ACT_REOPEN)
+        if score > 13:
+            last = last + dt.timedelta(days=rng.randint(7, 45))
+            if last <= REST_END:
+                rv = gen_violations(lvl * 0.75)
+                grade = band(sum(p for _, p in rv))
+                add_inspection(camis, last, "Cycle Inspection / Re-inspection", rv, grade, ACT_CITED if rv else ACT_NONE)
+            else:
+                grade = None
+        gap = {"A": (300, 420), "B": (150, 220), "C": (90, 150), None: (200, 300)}[grade]
+        day = last + dt.timedelta(days=rng.randint(*gap))
+        pre = False
+
+build_table(
+    f"{CATALOG}.{SCHEMA_HEALTH}.inspections",
+    _schema(("inspection_id", StringType()), ("camis", StringType()), ("inspection_date", DateType()),
+            ("inspection_type", StringType()), ("score", IntegerType()), ("grade", StringType()), ("grade_date", DateType()),
+            ("action", StringType()), ("violation_count", IntegerType()), ("critical_violation_count", IntegerType())),
+    insp_rows,
+    "DOHMH restaurant inspections, Jan 2024 - Sep 2026. Grain: one row per inspection; a restaurant has many. RULE: A restaurant's current grade is the grade on its most recent inspection graded A, B or C.",
+    {"inspection_id": "Unique inspection identifier.",
+     "camis": "Restaurant inspected (joins restaurants.camis).",
+     "inspection_date": "Date of the inspection.",
+     "inspection_type": "Program / type, e.g. Cycle Inspection / Initial Inspection, Cycle Inspection / Re-inspection, Cycle Inspection / Reopening Inspection, Pre-permit (Operational) / Initial Inspection.",
+     "score": "Inspection score: total points for the violations cited. RULE: Lower is better. 0-13 = A, 14-27 = B, 28 or more = C.",
+     "grade": "Letter grade issued: A, B or C; Not Yet Graded (initial score above 13, awaiting re-inspection); Grade Pending (after a reopening).",
+     "grade_date": "Date the letter grade was issued (null if no A/B/C grade was issued).",
+     "action": "Action taken, e.g. violations cited, no violations, or Establishment Closed by DOHMH.",
+     "violation_count": "Number of violations cited on this inspection.",
+     "critical_violation_count": "Number of Critical or Public Health Hazard violations cited."},
+)
+build_table(
+    f"{CATALOG}.{SCHEMA_HEALTH}.violations",
+    _schema(("violation_id", StringType()), ("inspection_id", StringType()), ("camis", StringType()),
+            ("inspection_date", DateType()), ("violation_code", StringType()), ("points", IntegerType())),
+    viol_rows,
+    "Violations cited during restaurant inspections. Grain: one row per violation; an inspection can have several. RULE: Do not join this table to inspections when averaging scores or counting inspections: it repeats each inspection once per violation.",
+    {"violation_id": "Unique violation record identifier.",
+     "inspection_id": "Inspection the violation was cited on (joins inspections.inspection_id).",
+     "camis": "Restaurant (joins restaurants.camis).",
+     "inspection_date": "Date of the inspection.",
+     "violation_code": "Violation code (joins violation_codes.violation_code).",
+     "points": "Points this violation added to the inspection score."},
+)
+
+# COMMAND ----------
+
+# ---- rodent_inspections (Jan 2024 - Sep 2026) ----
+RAT_ZONES = {"BX01", "BX02", "BX03", "BX04", "BX05", "BX06", "BK03", "BK04", "BK08", "BK16", "MN03", "MN09", "MN10", "MN11"}
+ROD_MONTH_W = {1: 0.7, 2: 0.7, 3: 0.9, 4: 1.0, 5: 1.2, 6: 1.35, 7: 1.4, 8: 1.35, 9: 1.15, 10: 1.0, 11: 0.8, 12: 0.7}
+rod_months = [dt.date(y, m, 1) for y in (2024, 2025, 2026) for m in range(1, 13) if dt.date(y, m, 1) <= dt.date(2026, 9, 1)]
+rod_rows = []
+for i in range(15000):
+    month = rng.choices(rod_months, weights=[ROD_MONTH_W[m.month] for m in rod_months])[0]
+    day = month + dt.timedelta(days=rng.randint(0, 27))
+    code, _, boro, _ = rng.choices(NYC_CDS, weights=[c[3] * (2.2 if c[0] in RAT_ZONES else 1.0) for c in NYC_CDS])[0]
+    zone = code in RAT_ZONES
+    itype = rng.choices(["Initial", "Compliance", "Bait", "Clean Up"], weights=[55, 20, 18, 7])[0]
+    if itype in ("Initial", "Compliance"):
+        years = (day - dt.date(2024, 1, 1)).days / 365.0
+        p_rat = 0.22 * (1.6 if zone else 1.0) * (1.15 if month.month in (6, 7, 8) else 1.0) * (1 - 0.10 * years)
+        p_rat *= 0.7 if itype == "Compliance" else 1.0
+        u = rng.random()
+        result = "Rat Activity" if u < p_rat else ("Failed for Other R" if u < p_rat + 0.12 else "Passed")
+    else:
+        result = "Bait applied" if itype == "Bait" else "Cleanup done"
+    rod_rows.append((f"R{3000000 + i}", f"J{1200000 + rng.randint(0, 9999)}", day, itype, result, boro, code, zone,
+                     rng.choices(["Residential", "Mixed Use", "Commercial", "Vacant Lot", "Public Park"], weights=[52, 18, 14, 11, 5])[0]))
+build_table(
+    f"{CATALOG}.{SCHEMA_HEALTH}.rodent_inspections",
+    _schema(("inspection_id", StringType()), ("job_id", StringType()), ("inspection_date", DateType()),
+            ("inspection_type", StringType()), ("result", StringType()), ("borough", StringType()),
+            ("community_district", StringType()), ("in_rat_mitigation_zone", BooleanType()), ("property_type", StringType())),
+    rod_rows,
+    "DOHMH rodent control visits to properties, Jan 2024 - Sep 2026. Grain: one row per visit. RULE: Only Initial and Compliance visits are inspections with a pass/fail result; Bait and Clean Up visits are treatments.",
+    {"inspection_id": "Unique visit identifier.",
+     "job_id": "Rodent control job the visit belongs to.",
+     "inspection_date": "Date of the visit.",
+     "inspection_type": "Initial (first inspection), Compliance (re-check after a failed inspection), Bait (rodenticide applied), Clean Up (DOHMH clean-up).",
+     "result": "Outcome: Passed, Rat Activity (active rat signs found), Failed for Other R (other conditions, e.g. garbage), Bait applied, Cleanup done.",
+     "borough": "Borough of the property.",
+     "community_district": "Community district (joins community_districts.community_district).",
+     "in_rat_mitigation_zone": "TRUE if the property is in one of the City's Rat Mitigation Zones.",
+     "property_type": "Type of property visited."},
+)
+
+# COMMAND ----------
+
+# MAGIC %md ## 5 · Grant attendee access (optional)
+
+# COMMAND ----------
+
+if SHARE_GROUP:
+    spark.sql(f"GRANT USE CATALOG ON CATALOG {CATALOG} TO `{SHARE_GROUP}`")
+    for schema in ALL_SCHEMAS:
+        # CREATE TABLE lets attendees build their own metric views in Lab 4 (metric views need it on the target schema)
+        spark.sql(f"GRANT USE SCHEMA, SELECT, CREATE TABLE ON SCHEMA {CATALOG}.{schema} TO `{SHARE_GROUP}`")
+    print(f"Granted USE CATALOG / USE SCHEMA / SELECT / CREATE TABLE on {len(ALL_SCHEMAS)} schemas to `{SHARE_GROUP}`.")
+else:
+    print("share_with_group is empty - skipping grants.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6 · Genie spaces
+# MAGIC
+# MAGIC Each domain below defines the **starter** content (tables, sample questions, a short instruction) and the
+# MAGIC **curated** extras (richer instructions, example SQL, join specs, SQL measures, benchmarks, and one Unity Catalog
+# MAGIC **metric view** per domain). The curated extras double as the workshop **answer key**.
+
+# COMMAND ----------
+
+A = f"{CATALOG}.{SCHEMA_AGING}"
+T = f"{CATALOG}.{SCHEMA_TRANSIT}"
+W = f"{CATALOG}.{SCHEMA_WATER}"
+H = f"{CATALOG}.{SCHEMA_HEALTH}"
+
+DOMAINS = {
+    "aging": {
+        "title": "NYC Aging & Home Care",
+        "description": "Frail older New Yorkers: MLTC enrollment, UAS-NY functional assessments, monthly home-care services, NYC Aging program waitlists and community-district roll-ups. Synthetic workshop data.",
+        "schema": SCHEMA_AGING,
+        "tables": ["clients", "functional_assessments", "home_care_services", "mltc_plans",
+                   "aging_programs", "cd_aging_metrics", "community_districts"],
+        "starter_instructions": "This space covers older and disabled New Yorkers served by NYC Aging, HRA and Medicaid managed long-term care. All data is synthetic.",
+        "curated_instructions": (
+            "This space covers older and disabled New Yorkers served by NYC Aging (formerly DFTA), HRA and Medicaid managed long-term care (MLTC). All data is synthetic.\n\n"
+            "Definitions:\n"
+            "- 'Frail' means clients.medically_frail = TRUE unless the user mentions the frailty index.\n"
+            "- 'Isolated' or 'at risk of isolation' means medically_frail = TRUE AND living_alone = TRUE.\n"
+            "- ADL = Activities of Daily Living; IADL = Instrumental ADLs. Higher = more impaired.\n"
+            "- 'Eligible for personal care' or 'meets the minimum needs rule' = functional_assessments.meets_min_adl_need = TRUE.\n"
+            "- 'Nursing home level of care' = functional_assessments.nursing_facility_loc = TRUE.\n\n"
+            "Rules:\n"
+            "- A client can have several assessments. For a client's CURRENT status, use only their most recent assessment (latest assessment_date per client_id).\n"
+            "- 'This month' / 'latest month' for services = MAX(service_month) in home_care_services.\n"
+            "- Per-capita rates use community_districts.population; express as per 10,000 residents.\n"
+            "- When asked about waitlists, use aging_programs.waitlist.\n"
+            "- 'Waiting for home care' means the EISEP Home Care waitlist only. Other waitlists (meals, case management, caregiver support) are for other services; do not add them in.\n"
+            "- Always show community districts with both the code and cd_name.\n"
+            "- State units: cost_usd is US dollars; units_delivered depends on unit_type (hour/day/meal).\n"
+            "- For client counts, frailty and isolation, prefer the client_metrics metric view (query measures with MEASURE())."
+        ),
+        "sample_questions": [
+            "How many medically frail clients are there in each borough?",
+            "Which NYC Aging program has the longest waitlist?",
+            "What is the total home care cost by service category?",
+            "Which MLTC plan has the best quality score?",
+            "Show the top 10 community districts by frail clients living alone.",
+        ],
+        "example_sqls": [
+            ("Which community districts have the most frail older adults living alone?",
+             f"SELECT c.community_district, d.cd_name, d.borough, COUNT(*) AS frail_living_alone\n"
+             f"FROM {A}.clients c JOIN {A}.community_districts d ON c.community_district = d.community_district\n"
+             f"WHERE c.medically_frail AND c.living_alone AND c.enrollment_status <> 'Disenrolled'\n"
+             f"GROUP BY c.community_district, d.cd_name, d.borough ORDER BY frail_living_alone DESC LIMIT 10"),
+            ("What share of clients meet the minimum ADL need for personal care, based on their latest assessment?",
+             f"WITH latest AS (\n  SELECT * FROM {A}.functional_assessments\n"
+             f"  QUALIFY ROW_NUMBER() OVER (PARTITION BY client_id ORDER BY assessment_date DESC) = 1\n)\n"
+             f"SELECT COUNT(*) AS clients_assessed, SUM(CAST(meets_min_adl_need AS INT)) AS meets_min_need,\n"
+             f"  ROUND(100.0 * SUM(CAST(meets_min_adl_need AS INT)) / COUNT(*), 1) AS pct_meets_min_need\nFROM latest"),
+            ("What was the total home care cost by service category in the latest month?",
+             f"SELECT service_category, unit_type, SUM(units_delivered) AS units, ROUND(SUM(cost_usd), 0) AS total_cost_usd,\n"
+             f"  COUNT(DISTINCT client_id) AS clients\nFROM {A}.home_care_services\n"
+             f"WHERE service_month = (SELECT MAX(service_month) FROM {A}.home_care_services)\n"
+             f"GROUP BY service_category, unit_type ORDER BY total_cost_usd DESC"),
+            ("Frail clients per 10,000 residents by borough",
+             f"WITH pop AS (SELECT borough, SUM(population) AS population FROM {A}.community_districts GROUP BY borough),\n"
+             f"frail AS (SELECT borough, COUNT(*) AS frail_clients FROM {A}.clients WHERE medically_frail GROUP BY borough)\n"
+             f"SELECT p.borough, f.frail_clients, p.population, ROUND(f.frail_clients * 10000.0 / p.population, 2) AS frail_per_10k\n"
+             f"FROM pop p JOIN frail f ON p.borough = f.borough ORDER BY frail_per_10k DESC"),
+            ("Which MLTC plan takes longest to start services?",
+             f"SELECT plan_name, plan_type, avg_days_to_service_start, nyc_enrollment\nFROM {A}.mltc_plans ORDER BY avg_days_to_service_start DESC"),
+        ],
+        "joins": [
+            ("clients", "community_districts", "`clients`.`community_district` = `community_districts`.`community_district`", "MANY_TO_ONE"),
+            ("clients", "mltc_plans", "`clients`.`plan_id` = `mltc_plans`.`plan_id`", "MANY_TO_ONE"),
+            ("functional_assessments", "clients", "`functional_assessments`.`client_id` = `clients`.`client_id`", "MANY_TO_ONE"),
+            ("home_care_services", "clients", "`home_care_services`.`client_id` = `clients`.`client_id`", "MANY_TO_ONE"),
+        ],
+        "measures": [
+            ("frail_clients", "Frail clients", "SUM(CAST(clients.medically_frail AS INT))", ["frail", "medically frail count"]),
+            ("total_service_cost", "Total service cost (USD)", "SUM(home_care_services.cost_usd)", ["home care spend", "service cost"]),
+        ],
+        "benchmarks": [
+            ("How many active clients are medically frail?",
+             f"SELECT COUNT(*) FROM {A}.clients WHERE medically_frail AND enrollment_status = 'Active'"),
+            ("Which program has the largest waitlist?",
+             f"SELECT program_name, waitlist FROM {A}.aging_programs ORDER BY waitlist DESC LIMIT 1"),
+            ("How many clients are enrolled in each MLTC plan?",
+             f"SELECT p.plan_name, COUNT(*) AS clients FROM {A}.clients c JOIN {A}.mltc_plans p ON c.plan_id = p.plan_id GROUP BY p.plan_name ORDER BY clients DESC"),
+            ("What is the average frailty index on clients' most recent assessment, by borough?",
+             f"SELECT c.borough, ROUND(AVG(a.frailty_index), 3) AS avg_frailty_index FROM (SELECT * FROM {A}.functional_assessments QUALIFY ROW_NUMBER() OVER (PARTITION BY client_id ORDER BY assessment_date DESC) = 1) a JOIN {A}.clients c ON a.client_id = c.client_id GROUP BY c.borough ORDER BY avg_frailty_index DESC"),
+            ("What was total Medicaid-funded home care cost in September 2026?",
+             f"SELECT ROUND(SUM(cost_usd), 0) FROM {A}.home_care_services WHERE funding_source = 'Medicaid' AND service_month = DATE'2026-09-01'"),
+        ],
+    },
+    "transit": {
+        "title": "NYC Transit Finance",
+        "description": "OMB-style analysis of NYC transit: agency operating finance, farebox recovery, ridership & fare evasion, congestion-pricing revenue, funding sources and the capital program. Synthetic workshop data.",
+        "schema": SCHEMA_TRANSIT,
+        "tables": ["transit_agencies", "monthly_financials", "ridership", "cbd_toll_program",
+                   "funding_sources", "capital_projects"],
+        "starter_instructions": "This space covers NYC-area public-transit finance and ridership (MTA agencies plus NYC Ferry and the Staten Island Ferry). All data is synthetic.",
+        "curated_instructions": (
+            "This space covers NYC-area public-transit finance (MTA agencies, NYC DOT's Staten Island Ferry and NYCEDC's NYC Ferry). All data is synthetic.\n\n"
+            "Units:\n"
+            "- Every column ending in _m is MILLIONS of US dollars. public_subsidy_per_trip_usd is in DOLLARS. Always state the unit.\n\n"
+            "Definitions:\n"
+            "- 'Ridership' = ridership.total_trips. 'Weekday ridership' = avg_weekday_trips.\n"
+            "- 'Deficit' = negative operating_balance_m. 'Cost' or 'spend' = total_expense_m.\n"
+            "- 'Farebox recovery' for any period or group = SUM(fare_revenue_m) / SUM(total_expense_m). Never average farebox_recovery_ratio.\n"
+            "- 'Subsidy per rider' for a period = SUM(dedicated_taxes_m + state_city_subsidy_m + federal_funds_m) * 1e6 / SUM(total_trips).\n"
+            "- 'The MTA' = transit_agencies.operator = 'MTA' (NYCT-SUB, NYCT-BUS, MTABC, SIR, LIRR, MNR, AAR). Never match 'MTA' against agency_id.\n"
+            "- 'The subway' = agency_id 'NYCT-SUB'; 'buses' = NYCT-BUS and MTABC; 'commuter rail' = LIRR and MNR; 'ferries' = SIF and NYCF.\n"
+            "- 'Congestion pricing' = cbd_toll_program. Its net revenue funds the CAPITAL program, not operating budgets.\n\n"
+            "Rules:\n"
+            "- 'Last 12 months' = the 12 most recent months in the data (latest month is MAX(month)).\n"
+            "- The Staten Island Ferry is fare-free; exclude SIF when ranking agencies by farebox recovery unless asked. Filter on agency_id (or the metric view's `Agency ID`), not the agency name, and drop NULL ratios before ranking.\n"
+            "- The MTA fiscal year equals the calendar year (use calendar_year).\n"
+            "- For revenue, expense, deficit, subsidy and farebox questions, prefer the transit_operating_metrics metric view (query measures with MEASURE())."
+        ),
+        "sample_questions": [
+            "Which agency had the largest operating deficit over the last 12 months?",
+            "What is the subway's farebox recovery ratio in 2025?",
+            "How much net revenue has congestion pricing raised so far?",
+            "Which agency has the highest fare evasion rate?",
+            "List capital projects that are over budget.",
+        ],
+        "example_sqls": [
+            ("Operating deficit by agency over the last 12 months",
+             f"SELECT f.agency_id, a.agency_name, ROUND(SUM(f.operating_balance_m), 1) AS operating_balance_m\n"
+             f"FROM {T}.monthly_financials f JOIN {T}.transit_agencies a ON f.agency_id = a.agency_id\n"
+             f"WHERE f.month > add_months((SELECT MAX(month) FROM {T}.monthly_financials), -12)\n"
+             f"GROUP BY f.agency_id, a.agency_name ORDER BY operating_balance_m ASC"),
+            ("Farebox recovery ratio by agency for 2025",
+             f"SELECT a.agency_name, ROUND(SUM(f.fare_revenue_m) / SUM(f.total_expense_m), 3) AS farebox_recovery_ratio\n"
+             f"FROM {T}.monthly_financials f JOIN {T}.transit_agencies a ON f.agency_id = a.agency_id\n"
+             f"WHERE f.calendar_year = 2025 AND f.agency_id <> 'SIF'\n"
+             f"GROUP BY a.agency_name ORDER BY farebox_recovery_ratio DESC"),
+            ("Public subsidy per trip by agency in 2025",
+             f"SELECT a.agency_name, ROUND(SUM(f.dedicated_taxes_m + f.state_city_subsidy_m + f.federal_funds_m) * 1e6 / SUM(r.total_trips), 2) AS subsidy_per_trip_usd\n"
+             f"FROM {T}.monthly_financials f\nJOIN {T}.ridership r ON f.agency_id = r.agency_id AND f.month = r.month\n"
+             f"JOIN {T}.transit_agencies a ON f.agency_id = a.agency_id\nWHERE f.calendar_year = 2025\n"
+             f"GROUP BY a.agency_name ORDER BY subsidy_per_trip_usd DESC"),
+            ("How much net revenue has congestion pricing generated since launch?",
+             f"SELECT MIN(month) AS first_month, MAX(month) AS latest_month, ROUND(SUM(net_revenue_m), 1) AS net_revenue_m,\n"
+             f"  ROUND(AVG(traffic_reduction_pct), 1) AS avg_traffic_reduction_pct\nFROM {T}.cbd_toll_program"),
+            ("Subway ridership year over year by month",
+             f"SELECT month, total_trips, LAG(total_trips, 12) OVER (ORDER BY month) AS trips_prior_year,\n"
+             f"  ROUND(100.0 * (total_trips / LAG(total_trips, 12) OVER (ORDER BY month) - 1), 1) AS yoy_pct\n"
+             f"FROM {T}.ridership WHERE agency_id = 'NYCT-SUB' ORDER BY month"),
+        ],
+        "joins": [
+            ("monthly_financials", "transit_agencies", "`monthly_financials`.`agency_id` = `transit_agencies`.`agency_id`", "MANY_TO_ONE"),
+            ("ridership", "transit_agencies", "`ridership`.`agency_id` = `transit_agencies`.`agency_id`", "MANY_TO_ONE"),
+            ("monthly_financials", "ridership", "`monthly_financials`.`agency_id` = `ridership`.`agency_id` AND `monthly_financials`.`month` = `ridership`.`month`", "ONE_TO_ONE"),
+            ("capital_projects", "transit_agencies", "`capital_projects`.`agency_id` = `transit_agencies`.`agency_id`", "MANY_TO_ONE"),
+        ],
+        "measures": [
+            ("farebox_recovery", "Farebox recovery ratio", "SUM(monthly_financials.fare_revenue_m) / SUM(monthly_financials.total_expense_m)", ["farebox", "fare recovery"]),
+            ("operating_balance", "Operating balance ($M)", "SUM(monthly_financials.operating_balance_m)", ["deficit", "surplus", "net operating result"]),
+        ],
+        "benchmarks": [
+            ("What was total subway ridership in 2025?",
+             f"SELECT SUM(total_trips) FROM {T}.ridership WHERE agency_id = 'NYCT-SUB' AND YEAR(month) = 2025"),
+            ("What was the MTA-wide farebox recovery ratio in 2025?",
+             f"SELECT ROUND(SUM(f.fare_revenue_m) / SUM(f.total_expense_m), 3) FROM {T}.monthly_financials f JOIN {T}.transit_agencies a ON f.agency_id = a.agency_id WHERE a.operator = 'MTA' AND f.calendar_year = 2025"),
+            ("What share of FY2026 funding is capital versus operating?",
+             f"SELECT budget_type, SUM(amount_m) AS amount_m, ROUND(100 * SUM(amount_m) / SUM(SUM(amount_m)) OVER (), 1) AS pct FROM {T}.funding_sources GROUP BY budget_type"),
+            ("Which capital projects have spent more than their budget?",
+             f"SELECT project_id, project_name, budget_m, spent_to_date_m FROM {T}.capital_projects WHERE spent_to_date_m > budget_m ORDER BY spent_to_date_m - budget_m DESC"),
+            ("What was average daily congestion zone entries in the most recent month?",
+             f"SELECT month, avg_daily_entries FROM {T}.cbd_toll_program ORDER BY month DESC LIMIT 1"),
+        ],
+    },
+    "water": {
+        "title": "NYC DEP Water & Sewer",
+        "description": "NYC DEP / Water Board operations and affordability: billing and arrears, rate schedules by fiscal year, water main breaks, DEP 311 requests, reservoir storage, assistance programs and infrastructure condition. Synthetic workshop data.",
+        "schema": SCHEMA_WATER,
+        "tables": ["water_accounts", "monthly_billing", "rate_schedules", "water_main_breaks",
+                   "service_requests_311", "reservoir_storage", "assistance_programs",
+                   "infrastructure_assets", "community_districts"],
+        "starter_instructions": "This space covers NYC DEP water and sewer operations, billing and affordability. All data is synthetic.",
+        "curated_instructions": (
+            "This space covers NYC Department of Environmental Protection (DEP) water and sewer operations, billing and affordability. All data is synthetic.\n\n"
+            "Time:\n"
+            "- NYC fiscal year runs July 1 - June 30. 'FY2026' = Jul 2025 - Jun 2026. Use the fiscal_year column when a user says FY.\n"
+            "- 'Winter' = December, January and February. 'Last winter' = the most recent complete Dec-Feb (Dec 2025 - Feb 2026 in this data).\n\n"
+            "Definitions:\n"
+            "- 'Arrears' or 'debt' = monthly_billing.arrears_balance_usd. It is a running balance: ALWAYS filter to one bill_month (default the latest, MAX(bill_month)); never sum across months.\n"
+            "- 'Delinquent' = arrears_balance_usd > 0 in the latest month. 'Lien-eligible' = water_accounts.account_status = 'Lien-Eligible'.\n"
+            "- 1 ccf = 100 cubic feet = 748 gallons.\n"
+            "- 'Trunk main' = main_diameter_in >= 20.\n"
+            "- 'No water complaints' = service_requests_311.descriptor = 'No Water'. Response time = days_to_close for Closed requests.\n"
+            "- System-wide reservoir level for a date = SUM(storage_bg) / SUM(capacity_bg) * 100. Never average pct_full.\n\n"
+            "Rules:\n"
+            "- rate_schedules has one row per rate_code per fiscal_year: join on BOTH rate_code and fiscal_year.\n"
+            "- Show community districts with both code and cd_name (join community_districts).\n"
+            "- Dollar columns are USD unless suffixed _m (millions).\n"
+            "- For billing, arrears and delinquency questions, prefer the water_billing_metrics metric view (query measures with MEASURE())."
+        ),
+        "sample_questions": [
+            "What is the total arrears balance by borough?",
+            "How many water main breaks happened each winter?",
+            "What is the average time to close No Water complaints by borough?",
+            "How full are the reservoirs right now compared to normal?",
+            "Which assistance program has issued the most credits?",
+        ],
+        "example_sqls": [
+            ("Total arrears and delinquent accounts by borough as of the latest month",
+             f"SELECT a.borough, COUNT_IF(b.arrears_balance_usd > 0) AS delinquent_accounts,\n"
+             f"  ROUND(SUM(b.arrears_balance_usd), 0) AS total_arrears_usd\n"
+             f"FROM {W}.monthly_billing b JOIN {W}.water_accounts a ON b.account_id = a.account_id\n"
+             f"WHERE b.bill_month = (SELECT MAX(bill_month) FROM {W}.monthly_billing)\n"
+             f"GROUP BY a.borough ORDER BY total_arrears_usd DESC"),
+            ("Water main breaks per winter by borough",
+             f"SELECT CASE WHEN MONTH(break_date) = 12 THEN YEAR(break_date) + 1 ELSE YEAR(break_date) END AS winter_ending,\n"
+             f"  borough, COUNT(*) AS breaks\nFROM {W}.water_main_breaks WHERE MONTH(break_date) IN (12, 1, 2)\n"
+             f"GROUP BY 1, 2 ORDER BY 1, 3 DESC"),
+            ("Average days to close No Water complaints by borough",
+             f"SELECT borough, COUNT(*) AS closed_requests, ROUND(AVG(days_to_close), 2) AS avg_days_to_close,\n"
+             f"  ROUND(PERCENTILE(days_to_close, 0.9), 2) AS p90_days_to_close\n"
+             f"FROM {W}.service_requests_311 WHERE descriptor = 'No Water' AND status = 'Closed'\n"
+             f"GROUP BY borough ORDER BY avg_days_to_close DESC"),
+            ("System-wide reservoir storage versus normal on the latest date",
+             f"SELECT reading_date, ROUND(SUM(storage_bg) / SUM(capacity_bg) * 100, 1) AS systemwide_pct_full,\n"
+             f"  ROUND(MAX(normal_pct_full), 1) AS normal_pct_full, MAX(drought_status) AS drought_status\n"
+             f"FROM {W}.reservoir_storage WHERE reading_date = (SELECT MAX(reading_date) FROM {W}.reservoir_storage)\n"
+             f"GROUP BY reading_date"),
+            ("Average monthly bill for 1-3 family homes in FY2026 vs FY2027",
+             f"SELECT b.fiscal_year, r.water_rate_per_ccf, ROUND(AVG(b.billed_amount_usd), 2) AS avg_monthly_bill_usd\n"
+             f"FROM {W}.monthly_billing b JOIN {W}.water_accounts a ON b.account_id = a.account_id\n"
+             f"JOIN {W}.rate_schedules r ON a.rate_code = r.rate_code AND b.fiscal_year = r.fiscal_year\n"
+             f"WHERE a.rate_code = 'R1' GROUP BY b.fiscal_year, r.water_rate_per_ccf ORDER BY b.fiscal_year"),
+        ],
+        "joins": [
+            ("monthly_billing", "water_accounts", "`monthly_billing`.`account_id` = `water_accounts`.`account_id`", "MANY_TO_ONE"),
+            ("water_accounts", "community_districts", "`water_accounts`.`community_district` = `community_districts`.`community_district`", "MANY_TO_ONE"),
+            ("water_main_breaks", "community_districts", "`water_main_breaks`.`community_district` = `community_districts`.`community_district`", "MANY_TO_ONE"),
+            ("service_requests_311", "community_districts", "`service_requests_311`.`community_district` = `community_districts`.`community_district`", "MANY_TO_ONE"),
+        ],
+        "measures": [
+            ("systemwide_pct_full", "System-wide reservoir % full", "SUM(reservoir_storage.storage_bg) / SUM(reservoir_storage.capacity_bg) * 100", ["reservoir level", "storage percent"]),
+            ("break_count", "Water main breaks", "COUNT(water_main_breaks.break_id)", ["main breaks", "breaks"]),
+        ],
+        "benchmarks": [
+            ("What is total arrears citywide as of the latest bill month?",
+             f"SELECT ROUND(SUM(arrears_balance_usd), 0) FROM {W}.monthly_billing WHERE bill_month = (SELECT MAX(bill_month) FROM {W}.monthly_billing)"),
+            ("How many accounts are lien-eligible, by borough?",
+             f"SELECT borough, COUNT(*) FROM {W}.water_accounts WHERE account_status = 'Lien-Eligible' GROUP BY borough ORDER BY 2 DESC"),
+            ("What was the lowest system-wide reservoir level in 2024 and on what date?",
+             f"SELECT reading_date, ROUND(SUM(storage_bg) / SUM(capacity_bg) * 100, 1) AS pct FROM {W}.reservoir_storage WHERE YEAR(reading_date) = 2024 GROUP BY reading_date ORDER BY pct ASC LIMIT 1"),
+            ("How many water main breaks were on unlined cast iron pipe?",
+             f"SELECT COUNT(*) FROM {W}.water_main_breaks WHERE pipe_material = 'Unlined Cast Iron'"),
+            ("What were total water and sewer charges billed in FY2026?",
+             f"SELECT ROUND(SUM(water_charge_usd), 0) AS water_usd, ROUND(SUM(sewer_charge_usd), 0) AS sewer_usd FROM {W}.monthly_billing WHERE fiscal_year = 2026"),
+        ],
+    },
+}
+
+DOMAINS["health"] = {
+    "title": "NYC DOHMH Food Safety & Rodents",
+    "description": "NYC Health Department food-safety and rodent-control analytics: restaurant inspections and letter grades, violations, DOHMH closures, and rodent inspections including Rat Mitigation Zones. Synthetic workshop data.",
+    "schema": SCHEMA_HEALTH,
+    "tables": ["restaurants", "inspections", "violations", "violation_codes", "rodent_inspections", "community_districts"],
+    "starter_instructions": "This space covers NYC DOHMH restaurant inspections and rodent control. All data is synthetic.",
+    "curated_instructions": (
+        "This space covers NYC Department of Health and Mental Hygiene (DOHMH) restaurant inspections and rodent control. All data is synthetic.\n\n"
+        "Scores and grades:\n"
+        "- Inspection score = total violation points. LOWER IS BETTER. 'Best' means the lowest score; 'worst' means the highest.\n"
+        "- Grade bands: 0-13 = A, 14-27 = B, 28+ = C. An initial inspection only issues an A; otherwise the restaurant is re-inspected and graded A/B/C on that score.\n"
+        "- A restaurant's CURRENT grade = the grade on its most recent inspection where grade IN ('A','B','C'). Filter to grade IN ('A','B','C') FIRST, take the latest row per camis, and only THEN filter to a specific grade. Never count A-grade inspections as A-grade restaurants.\n"
+        "- When comparing places or cuisines on scores, use initial inspections only (inspection_type LIKE '%Initial Inspection'), because re-inspections are only done for restaurants that scored poorly.\n\n"
+        "Definitions:\n"
+        "- 'Closed', 'shut down' or 'closure' = inspections.action LIKE 'Establishment Closed by DOHMH%'. A C grade is NOT a closure.\n"
+        "- 'How many restaurants were closed' = COUNT(DISTINCT camis) of closure inspections; 'how many closures' = number of closure inspections (a restaurant can be closed more than once).\n"
+        "- 'Critical violation' = violation_codes.is_critical = TRUE (Critical or Public Health Hazard). 'Mice' / 'roaches' = codes 04L / 04M.\n"
+        "- 'Rat activity rate' = share of rodent Initial inspections with result = 'Rat Activity'. Bait and Clean Up visits are treatments, not inspections: exclude them.\n"
+        "- 'Rat zones' = rodent_inspections.in_rat_mitigation_zone = TRUE.\n\n"
+        "Rules:\n"
+        "- Average scores and count inspections from the inspections table. Do NOT join violations for that: it repeats each inspection once per violation.\n"
+        "- Show community districts with both code and cd_name (join community_districts).\n"
+        "- For scores, grades and closures, prefer the inspection_metrics metric view (query measures with MEASURE())."
+    ),
+    "sample_questions": [
+        "How many restaurant inspections were done each month?",
+        "What are the most common violations?",
+        "Which cuisines have the highest average inspection scores?",
+        "How many restaurants are there in each borough?",
+        "Where were the most rodent inspections?",
+    ],
+    "example_sqls": [
+        ("How many restaurants currently hold each letter grade?",
+         f"SELECT grade AS current_grade, COUNT(*) AS restaurants\nFROM (SELECT * FROM {H}.inspections WHERE grade IN ('A', 'B', 'C')\n  QUALIFY ROW_NUMBER() OVER (PARTITION BY camis ORDER BY inspection_date DESC, inspection_id DESC) = 1)\nGROUP BY grade ORDER BY grade"),
+        ("Which community districts have the best average inspection scores?",
+         f"SELECT r.community_district, d.cd_name, COUNT(*) AS initial_inspections, ROUND(AVG(i.score), 1) AS avg_score\n"
+         f"FROM {H}.inspections i JOIN {H}.restaurants r ON i.camis = r.camis\n"
+         f"JOIN {H}.community_districts d ON r.community_district = d.community_district\n"
+         f"WHERE i.inspection_type LIKE '%Initial Inspection'\n"
+         f"GROUP BY r.community_district, d.cd_name HAVING COUNT(*) >= 30 ORDER BY AVG(i.score) ASC LIMIT 10"),
+        ("How many restaurants currently have an A grade?",
+         f"SELECT COUNT(*) AS restaurants_currently_a\nFROM (SELECT * FROM {H}.inspections WHERE grade IN ('A', 'B', 'C')\n"
+         f"      QUALIFY ROW_NUMBER() OVER (PARTITION BY camis ORDER BY inspection_date DESC, inspection_id DESC) = 1) latest\n"
+         f"WHERE latest.grade = 'A'"),
+        ("How many restaurants did DOHMH close in 2025, by borough?",
+         f"SELECT r.borough, COUNT(DISTINCT i.camis) AS restaurants_closed, COUNT(*) AS closure_events\nFROM {H}.inspections i JOIN {H}.restaurants r ON i.camis = r.camis\n"
+         f"WHERE i.action LIKE 'Establishment Closed by DOHMH%' AND YEAR(i.inspection_date) = 2025\n"
+         f"GROUP BY r.borough ORDER BY restaurants_closed DESC"),
+        ("What is the rat activity rate by borough in 2025?",
+         f"SELECT borough, COUNT(*) AS initial_inspections,\n"
+         f"  ROUND(100.0 * COUNT_IF(result = 'Rat Activity') / COUNT(*), 1) AS rat_activity_rate_pct\n"
+         f"FROM {H}.rodent_inspections WHERE inspection_type = 'Initial' AND YEAR(inspection_date) = 2025\n"
+         f"GROUP BY borough ORDER BY rat_activity_rate_pct DESC"),
+        ("What are the most common critical violations?",
+         f"SELECT v.violation_code, c.description, c.category, COUNT(*) AS times_cited\n"
+         f"FROM {H}.violations v JOIN {H}.violation_codes c ON v.violation_code = c.violation_code\n"
+         f"WHERE c.is_critical GROUP BY v.violation_code, c.description, c.category ORDER BY times_cited DESC LIMIT 10"),
+    ],
+    "joins": [
+        ("inspections", "restaurants", "`inspections`.`camis` = `restaurants`.`camis`", "MANY_TO_ONE"),
+        ("restaurants", "community_districts", "`restaurants`.`community_district` = `community_districts`.`community_district`", "MANY_TO_ONE"),
+        ("violations", "violation_codes", "`violations`.`violation_code` = `violation_codes`.`violation_code`", "MANY_TO_ONE"),
+        ("violations", "inspections", "`violations`.`inspection_id` = `inspections`.`inspection_id`", "MANY_TO_ONE"),
+        ("rodent_inspections", "community_districts", "`rodent_inspections`.`community_district` = `community_districts`.`community_district`", "MANY_TO_ONE"),
+    ],
+    "measures": [
+        ("avg_initial_score", "Average initial inspection score", "AVG(CASE WHEN inspections.inspection_type LIKE '%Initial Inspection' THEN inspections.score END)", ["average score", "inspection score", "sanitary score"]),
+        ("rat_activity_rate", "Rat activity rate", "SUM(CASE WHEN rodent_inspections.inspection_type = 'Initial' AND rodent_inspections.result = 'Rat Activity' THEN 1 ELSE 0 END) / SUM(CASE WHEN rodent_inspections.inspection_type = 'Initial' THEN 1 ELSE 0 END)", ["rat rate", "rat activity", "rodent failure rate"]),
+    ],
+    "benchmarks": [
+        ("How many restaurants are in Queens?",
+         f"SELECT COUNT(*) FROM {H}.restaurants WHERE borough = 'Queens'"),
+        ("How many DOHMH closures were there in 2025?",
+         f"SELECT COUNT(*) FROM {H}.inspections WHERE action LIKE 'Establishment Closed by DOHMH%' AND YEAR(inspection_date) = 2025"),
+        ("What share of restaurants currently hold an A grade?",
+         f"SELECT ROUND(100.0 * COUNT_IF(grade = 'A') / COUNT(*), 1) AS pct_a FROM (SELECT * FROM {H}.inspections WHERE grade IN ('A', 'B', 'C')\n  QUALIFY ROW_NUMBER() OVER (PARTITION BY camis ORDER BY inspection_date DESC, inspection_id DESC) = 1)"),
+        ("What was the rat activity rate on initial rodent inspections in 2025?",
+         f"SELECT ROUND(100.0 * COUNT_IF(result = 'Rat Activity') / COUNT(*), 1) FROM {H}.rodent_inspections WHERE inspection_type = 'Initial' AND YEAR(inspection_date) = 2025"),
+        ("Which violation code was cited most often?",
+         f"SELECT violation_code, COUNT(*) AS n FROM {H}.violations GROUP BY violation_code ORDER BY n DESC LIMIT 1"),
+    ],
+}
+
+# ---- Trusted assets (Lab 4, core): parameterized example queries. Genie labels answers from these as Trusted.
+#      (question, sql with :params, {param: (type, example value used by the self-test)})
+DOMAINS["aging"]["trusted"] = (
+    "How many isolated frail clients live in a borough?",
+    f"SELECT COUNT(*) AS isolated_frail_clients\nFROM {A}.clients\n"
+    f"WHERE medically_frail AND living_alone AND enrollment_status <> 'Disenrolled'\n  AND borough = :borough",
+    {"borough": ("String", "Brooklyn")})
+DOMAINS["transit"]["trusted"] = (
+    "What is the farebox recovery ratio for an agency in a given year?",
+    f"SELECT a.agency_name, f.calendar_year,\n  ROUND(SUM(f.fare_revenue_m) / SUM(f.total_expense_m), 3) AS farebox_recovery_ratio\n"
+    f"FROM {T}.monthly_financials f JOIN {T}.transit_agencies a ON f.agency_id = a.agency_id\n"
+    f"WHERE a.agency_name = :agency_name AND f.calendar_year = :year\nGROUP BY a.agency_name, f.calendar_year",
+    {"agency_name": ("String", "NYC Transit - Subway"), "year": ("Integer", 2025)})
+DOMAINS["water"]["trusted"] = (
+    "What is the current arrears balance in a borough?",
+    f"SELECT a.borough, COUNT_IF(b.arrears_balance_usd > 0) AS delinquent_accounts,\n  ROUND(SUM(b.arrears_balance_usd), 0) AS current_arrears_usd\n"
+    f"FROM {W}.monthly_billing b JOIN {W}.water_accounts a ON b.account_id = a.account_id\n"
+    f"WHERE b.bill_month = (SELECT MAX(bill_month) FROM {W}.monthly_billing) AND a.borough = :borough\nGROUP BY a.borough",
+    {"borough": ("String", "Bronx")})
+DOMAINS["health"]["trusted"] = (
+    "How many restaurants in a borough currently hold each letter grade?",
+    f"SELECT r.borough, g.grade AS current_grade, COUNT(*) AS restaurants\n"
+    f"FROM (SELECT * FROM {H}.inspections WHERE grade IN ('A', 'B', 'C')\n"
+    f"      QUALIFY ROW_NUMBER() OVER (PARTITION BY camis ORDER BY inspection_date DESC, inspection_id DESC) = 1) g\n"
+    f"JOIN {H}.restaurants r ON g.camis = r.camis\n"
+    f"WHERE r.borough = :borough\nGROUP BY r.borough, g.grade ORDER BY g.grade",
+    {"borough": ("String", "Manhattan")})
+
+# ---- Metric views (Lab 4 step 6). One per domain; each turns the definition traps into governed UC measures. ----
+DOMAINS["aging"]["metric_view"] = ("client_metrics", f"""version: 1.1
+source: {A}.clients
+comment: "Client counts and frailty KPIs for NYC aging and home-care clients (excludes disenrolled clients)."
+filter: enrollment_status <> 'Disenrolled'
+joins:
+  - name: dim_district
+    source: {A}.community_districts
+    'on': source.community_district = dim_district.community_district
+  - name: dim_plan
+    source: {A}.mltc_plans
+    'on': source.plan_id = dim_plan.plan_id
+dimensions:
+  - name: Borough
+    expr: source.borough
+  - name: Community District
+    expr: CONCAT(source.community_district, ' ', dim_district.cd_name)
+    comment: "Community district code and neighborhood name, e.g. BK05 East New York / Starrett City."
+  - name: Coverage Type
+    expr: source.coverage_type
+  - name: MLTC Plan
+    expr: dim_plan.plan_name
+  - name: Primary Language
+    expr: source.primary_language
+  - name: Age Group
+    expr: CASE WHEN source.age < 65 THEN 'Under 65' WHEN source.age < 75 THEN '65-74' WHEN source.age < 85 THEN '75-84' ELSE '85+' END
+measures:
+  - name: Clients
+    expr: COUNT(1)
+  - name: Frail Clients
+    expr: COUNT(1) FILTER (WHERE source.medically_frail)
+    synonyms: [frail, medically frail, frail older adults]
+  - name: Isolated Frail Clients
+    expr: COUNT(1) FILTER (WHERE source.medically_frail AND source.living_alone)
+    comment: "Agency definition of isolated: medically frail AND living alone."
+    synonyms: [isolated, isolated frail older adults, at risk of isolation, frail living alone]
+  - name: Frail Share
+    expr: MEASURE(`Frail Clients`) / MEASURE(`Clients`)
+    format:
+      type: percentage
+      decimal_places:
+        type: max
+        places: 1
+""", f"""SELECT `Community District`, MEASURE(`Isolated Frail Clients`) AS isolated_frail
+FROM {A}.client_metrics
+GROUP BY ALL ORDER BY isolated_frail DESC LIMIT 10""")
+
+DOMAINS["transit"]["metric_view"] = ("transit_operating_metrics", f"""version: 1.1
+source: {T}.monthly_financials
+comment: "Monthly transit operating finance KPIs. All dollar measures are millions of USD."
+joins:
+  - name: dim_agency
+    source: {T}.transit_agencies
+    'on': source.agency_id = dim_agency.agency_id
+dimensions:
+  - name: Month
+    expr: source.month
+  - name: Calendar Year
+    expr: source.calendar_year
+    comment: "The MTA fiscal year equals the calendar year."
+  - name: Agency
+    expr: dim_agency.agency_name
+    comment: "Agency NAME, e.g. 'NYC Transit - Subway', 'Staten Island Ferry'. Use Agency ID to filter by code."
+  - name: Agency ID
+    expr: source.agency_id
+    comment: "Agency code: NYCT-SUB, NYCT-BUS, MTABC, SIR, LIRR, MNR, AAR, SIF, NYCF."
+  - name: Operator
+    expr: dim_agency.operator
+  - name: Service Group
+    expr: CASE source.agency_id WHEN 'NYCT-SUB' THEN 'Subway' WHEN 'NYCT-BUS' THEN 'Buses' WHEN 'MTABC' THEN 'Buses' WHEN 'LIRR' THEN 'Commuter Rail' WHEN 'MNR' THEN 'Commuter Rail' WHEN 'SIF' THEN 'Ferries' WHEN 'NYCF' THEN 'Ferries' WHEN 'AAR' THEN 'Paratransit' ELSE 'Staten Island Railway' END
+    comment: "Agency definition: Buses = NYC Transit Bus + MTA Bus Company; Commuter Rail = LIRR + Metro-North; Ferries = Staten Island Ferry + NYC Ferry."
+    synonyms: [the buses, mode group, service]
+measures:
+  - name: Fare Revenue
+    expr: SUM(source.fare_revenue_m)
+    comment: "Passenger fare revenue, millions USD."
+  - name: Total Expense
+    expr: SUM(source.total_expense_m)
+    comment: "Total operating expense, millions USD."
+    synonyms: [cost, spend, operating cost]
+  - name: Operating Balance
+    expr: SUM(source.operating_balance_m)
+    comment: "Revenue minus expense, millions USD. Negative = deficit / loss."
+    synonyms: [deficit, surplus, loss, net operating result]
+  - name: Public Operating Support
+    expr: SUM(source.dedicated_taxes_m + source.state_city_subsidy_m + source.federal_funds_m)
+    comment: "Dedicated taxes + state/city subsidies + federal operating aid, millions USD. Congestion pricing is NOT included: it funds capital."
+    synonyms: [subsidy, public subsidy]
+  - name: Farebox Recovery Ratio
+    expr: SUM(source.fare_revenue_m) FILTER (WHERE source.agency_id <> 'SIF') / SUM(source.total_expense_m) FILTER (WHERE source.agency_id <> 'SIF')
+    comment: "Fare revenue / operating expense, weighted correctly across agencies and months. Excludes the fare-free Staten Island Ferry by policy, so it is NULL for SIF: drop NULLs when ranking."
+    synonyms: [farebox, farebox recovery, fare recovery]
+    format:
+      type: percentage
+      decimal_places:
+        type: max
+        places: 1
+""", f"""SELECT `Agency`, MEASURE(`Farebox Recovery Ratio`) AS farebox_recovery
+FROM {T}.transit_operating_metrics
+WHERE `Calendar Year` = 2025 AND `Agency` <> 'Staten Island Ferry'
+GROUP BY ALL ORDER BY farebox_recovery ASC""")
+
+DOMAINS["water"]["metric_view"] = ("water_billing_metrics", f"""version: 1.1
+source: |
+  SELECT b.account_id, b.bill_month, b.fiscal_year, b.consumption_ccf, b.water_charge_usd, b.sewer_charge_usd,
+         b.billed_amount_usd, b.paid_amount_usd, b.arrears_balance_usd,
+         a.borough, a.community_district, a.rate_code, a.account_status,
+         COALESCE(a.assistance_program, 'None') AS assistance_program,
+         b.bill_month = MAX(b.bill_month) OVER () AS is_latest_month
+  FROM {W}.monthly_billing b JOIN {W}.water_accounts a ON b.account_id = a.account_id
+comment: "Water and sewer billing, payments and arrears KPIs. NYC fiscal year runs July-June. Arrears measures are a snapshot as of the latest bill month."
+dimensions:
+  - name: Bill Month
+    expr: bill_month
+  - name: Fiscal Year
+    expr: fiscal_year
+    comment: "NYC fiscal year (FY2026 = Jul 2025 - Jun 2026)."
+    synonyms: [FY]
+  - name: Borough
+    expr: borough
+  - name: Community District
+    expr: community_district
+  - name: Rate Class
+    expr: CASE rate_code WHEN 'R1' THEN '1-3 Family Residential' WHEN 'MF' THEN 'Multifamily (Metered)' WHEN 'MCP' THEN 'Multifamily Conservation Program' WHEN 'CM' THEN 'Commercial' ELSE 'Industrial' END
+  - name: Assistance Program
+    expr: assistance_program
+  - name: Account Status
+    expr: account_status
+measures:
+  - name: Total Billed
+    expr: SUM(billed_amount_usd)
+    comment: "Water + sewer charges billed, USD."
+    synonyms: [charges, billings, water and sewer charges]
+  - name: Water Charges
+    expr: SUM(water_charge_usd)
+  - name: Sewer Charges
+    expr: SUM(sewer_charge_usd)
+  - name: Payments
+    expr: SUM(paid_amount_usd)
+  - name: Consumption CCF
+    expr: SUM(consumption_ccf)
+    comment: "Water use in ccf (1 ccf = 748 gallons)."
+  - name: Current Arrears
+    expr: SUM(arrears_balance_usd) FILTER (WHERE is_latest_month)
+    comment: "Outstanding unpaid balance as of the latest bill month, USD. A snapshot: never summed across months."
+    synonyms: [arrears, debt, outstanding balance, unpaid balance, total arrears]
+  - name: Delinquent Accounts
+    expr: COUNT(DISTINCT account_id) FILTER (WHERE is_latest_month AND arrears_balance_usd > 0)
+    comment: "Agency definition: accounts with an unpaid balance in the latest bill month."
+    synonyms: [delinquent, accounts in arrears, past due accounts]
+""", f"""SELECT `Borough`, MEASURE(`Current Arrears`) AS current_arrears, MEASURE(`Delinquent Accounts`) AS delinquent_accounts
+FROM {W}.water_billing_metrics
+GROUP BY ALL ORDER BY current_arrears DESC""")
+
+DOMAINS["health"]["metric_view"] = ("inspection_metrics", f"""version: 1.1
+source: {H}.inspections
+comment: "Restaurant inspection KPIs for NYC DOHMH. Inspection scores: lower is better."
+joins:
+  - name: dim_restaurant
+    source: {H}.restaurants
+    'on': source.camis = dim_restaurant.camis
+dimensions:
+  - name: Inspection Month
+    expr: DATE_TRUNC('MONTH', source.inspection_date)
+  - name: Inspection Year
+    expr: YEAR(source.inspection_date)
+  - name: Inspection Type
+    expr: source.inspection_type
+  - name: Borough
+    expr: dim_restaurant.borough
+  - name: Community District
+    expr: dim_restaurant.community_district
+  - name: Cuisine
+    expr: dim_restaurant.cuisine
+  - name: Chain
+    expr: CASE WHEN dim_restaurant.is_chain THEN 'Chain' ELSE 'Independent' END
+measures:
+  - name: Inspections
+    expr: COUNT(1)
+  - name: Restaurants Inspected
+    expr: COUNT(DISTINCT source.camis)
+  - name: Average Initial Score
+    expr: AVG(source.score) FILTER (WHERE source.inspection_type LIKE '%Initial Inspection')
+    comment: "Average score on initial inspections only (re-inspections are biased toward poor performers). Lower is better."
+    synonyms: [average score, inspection score, sanitary score]
+  - name: Grade A Rate
+    expr: COUNT(1) FILTER (WHERE source.grade = 'A') / COUNT(1) FILTER (WHERE source.grade IN ('A', 'B', 'C'))
+    comment: "Share of letter grades issued that were A."
+    synonyms: [A rate, share of A grades]
+    format:
+      type: percentage
+      decimal_places:
+        type: max
+        places: 1
+  - name: Closures
+    expr: COUNT(1) FILTER (WHERE source.action LIKE 'Establishment Closed by DOHMH%')
+    comment: "Number of closure events (inspections where DOHMH closed the restaurant). A C grade is not a closure."
+    synonyms: [closure events, number of closures, shutdowns]
+  - name: Restaurants Closed
+    expr: COUNT(DISTINCT source.camis) FILTER (WHERE source.action LIKE 'Establishment Closed by DOHMH%')
+    comment: "Distinct restaurants DOHMH closed at least once. Use for 'how many restaurants were closed / shut down'."
+    synonyms: [restaurants shut down, restaurants closed by DOHMH, closed restaurants]
+  - name: Average Score
+    expr: AVG(source.score)
+    comment: "Average score across all inspections. Lower is better. Prefer Average Initial Score when comparing places or cuisines."
+  - name: Critical Violations
+    expr: SUM(source.critical_violation_count)
+    synonyms: [critical, critical flags]
+""", f"""SELECT `Borough`, MEASURE(`Average Initial Score`) AS avg_initial_score, MEASURE(`Closures`) AS closures
+FROM {H}.inspection_metrics
+WHERE `Inspection Year` = 2025
+GROUP BY ALL ORDER BY avg_initial_score ASC""")
+
+# COMMAND ----------
+
+# MAGIC %md ### Create the metric views
+
+# COMMAND ----------
+
+for key, dom in DOMAINS.items():
+    name, yaml_body, _ = dom["metric_view"]
+    fq_mv = f"{CATALOG}.{dom['schema']}.{name}"
+    spark.sql(f"CREATE OR REPLACE VIEW {fq_mv} WITH METRICS LANGUAGE YAML AS $$\n{yaml_body}$$")
+    print(f"  ✓ metric view {fq_mv}")
+
+# COMMAND ----------
+
+import json
+import uuid
+import requests
+
+ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+TOKEN = ctx.apiToken().get()
+HOST = ctx.apiUrl().get()
+HDRS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+
+try:
+    me = requests.get(f"{HOST}/api/2.0/preview/scim/v2/Me", headers=HDRS, timeout=30).json()
+except Exception:
+    me = {}
+USER = me.get("userName", "")
+PARENT_PATH = f"/Users/{USER}" if USER else "/Users"
+print(f"Genie spaces live under: {PARENT_PATH}")
+
+
+def detect_warehouse():
+    """Pick a SQL warehouse: prefer a running serverless one (Free Edition has exactly one)."""
+    r = requests.get(f"{HOST}/api/2.0/sql/warehouses", headers=HDRS, timeout=60)
+    r.raise_for_status()
+    whs = r.json().get("warehouses", [])
+    if not whs:
+        raise RuntimeError("No SQL warehouse found. Create one under SQL Warehouses, or paste its ID into the warehouse_id widget.")
+    whs.sort(key=lambda w: (w.get("state") != "RUNNING", not w.get("enable_serverless_compute", False)))
+    print(f"Using SQL warehouse: {whs[0].get('name')} ({whs[0]['id']})")
+    return whs[0]["id"]
+
+
+def _hid():
+    """Genie serialized_space element ids must be 32-hex-char UUIDs (no hyphens)."""
+    return uuid.uuid4().hex
+
+
+def _by_id(items):
+    return sorted(items, key=lambda e: e["id"])
+
+
+def build_serialized_space(dom, curated):
+    # serialized_space v2 rules: string fields are ARRAYS; ids are hyphen-less hex; every id-keyed
+    # list is sorted by id; tables sorted by identifier; at most one text_instructions entry.
+    fq = lambda t: f"{CATALOG}.{dom['schema']}.{t}"
+    space = {
+        "version": 2,
+        "config": {"sample_questions": _by_id([{"id": _hid(), "question": [q]} for q in dom["sample_questions"]])},
+        "data_sources": {"tables": [{"identifier": t} for t in sorted(fq(t) for t in dom["tables"])]},
+        "instructions": {"text_instructions": [{
+            "id": _hid(), "content": [dom["curated_instructions"] if curated else dom["starter_instructions"]]}]},
+    }
+    if curated:
+        space["data_sources"]["metric_views"] = [{"identifier": fq(dom["metric_view"][0])}]
+        ins = space["instructions"]
+        ins["example_question_sqls"] = _by_id([{"id": _hid(), "question": [q], "sql": [s]} for q, s in dom["example_sqls"]])
+        ins["join_specs"] = _by_id([{
+            "id": _hid(),
+            "left": {"identifier": fq(l), "alias": l},
+            "right": {"identifier": fq(r), "alias": r},
+            "sql": [cond, f"--rt=FROM_RELATIONSHIP_TYPE_{rt}--"],
+        } for l, r, cond, rt in dom["joins"]])
+        ins["sql_snippets"] = {"measures": _by_id([{
+            "id": _hid(), "alias": alias, "display_name": name, "sql": [sql], "synonyms": syn,
+        } for alias, name, sql, syn in dom["measures"]])}
+        space["benchmarks"] = {"questions": _by_id([{
+            "id": _hid(), "question": [q], "answer": [{"format": "SQL", "content": [s]}],
+        } for q, s in dom["benchmarks"]])}
+    return json.dumps(space)
+
+
+def list_spaces():
+    out, token = {}, None
+    while True:
+        params = {"page_size": 100, **({"page_token": token} if token else {})}
+        r = requests.get(f"{HOST}/api/2.0/genie/spaces", headers=HDRS, params=params, timeout=60)
+        r.raise_for_status()
+        j = r.json()
+        for s in j.get("spaces", []):
+            out.setdefault(s.get("title"), s.get("space_id"))
+        token = j.get("next_page_token")
+        if not token:
+            return out
+
+
+def upsert_space(title, description, serialized, existing):
+    body = {"serialized_space": serialized, "warehouse_id": WAREHOUSE_ID, "title": title, "description": description}
+    if title in existing:
+        sid = existing[title]
+        r = requests.patch(f"{HOST}/api/2.0/genie/spaces/{sid}", headers=HDRS, data=json.dumps(body), timeout=120)
+        verb = "updated"
+    else:
+        r = requests.post(f"{HOST}/api/2.0/genie/spaces", headers=HDRS,
+                          data=json.dumps({**body, "parent_path": PARENT_PATH}), timeout=120)
+        verb = "created"
+        sid = r.json().get("space_id") if r.status_code < 300 else None
+    if r.status_code >= 300:
+        print(f"  ✗ {title} -> {r.status_code}: {r.text[:500]}")
+        return None
+    print(f"  ✓ {verb}: {title}\n      {HOST}/genie/rooms/{sid}")
+    if SHARE_GROUP:
+        p = requests.patch(f"{HOST}/api/2.0/permissions/genie/{sid}", headers=HDRS, timeout=60,
+                           data=json.dumps({"access_control_list": [{"group_name": SHARE_GROUP, "permission_level": "CAN_RUN"}]}))
+        print(f"      shared with {SHARE_GROUP}: {'ok' if p.status_code < 300 else p.text[:200]}")
+    return sid
+
+# COMMAND ----------
+
+SPACE_IDS = {}
+if GENIE_MODE != "none":
+    try:
+        if not WAREHOUSE_ID:
+            WAREHOUSE_ID = detect_warehouse()
+        existing = list_spaces()
+    except Exception as e:
+        print(f"Could not reach the Genie API ({str(e)[:200]}).\n"
+              "That's OK: the data and metric views are ready. Build your Genie space by hand (workshop Lab 1).")
+        GENIE_MODE = "none"
+if GENIE_MODE != "none":
+    variants = {"both": [False, True], "starter": [False], "curated": [True]}[GENIE_MODE]
+    for key, dom in DOMAINS.items():
+        for curated in variants:
+            title = f"{dom['title']} ({'Curated' if curated else 'Starter'})"
+            SPACE_IDS[title] = upsert_space(title, dom["description"], build_serialized_space(dom, curated), existing)
+    if SHARE_GROUP:
+        requests.patch(f"{HOST}/api/2.0/permissions/sql/warehouses/{WAREHOUSE_ID}", headers=HDRS, timeout=60,
+                       data=json.dumps({"access_control_list": [{"group_name": SHARE_GROUP, "permission_level": "CAN_USE"}]}))
+    print(json.dumps(SPACE_IDS, indent=2))
+else:
+    print("Skipped Genie space creation (genie_spaces = none).")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7 · Validate the answer key
+# MAGIC Runs every example SQL and benchmark SQL so facilitators know the answer key executes cleanly.
+
+# COMMAND ----------
+
+failures = 0
+for key, dom in DOMAINS.items():
+    mv_example = (f"metric view {dom['metric_view'][0]}", dom["metric_view"][2])
+    tq, tsql, tparams = dom["trusted"]
+    for pname, (ptype, pval) in tparams.items():  # substitute example values for the self-test
+        tsql = tsql.replace(f":{pname}", str(pval) if ptype == "Integer" else f"'{pval}'")
+    for q, sql in dom["example_sqls"] + dom["benchmarks"] + [mv_example, (f"trusted: {tq}", tsql)]:
+        try:
+            n = spark.sql(sql).limit(1000).count()
+            print(f"  ✓ [{key}] {q}  ({n} rows)")
+        except Exception as e:
+            failures += 1
+            print(f"  ✗ [{key}] {q}\n      {str(e)[:300]}")
+assert failures == 0, f"{failures} answer-key queries failed"
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 8 · Summary
+# MAGIC
+# MAGIC ```
+# MAGIC nyc_aging_home_care : clients, functional_assessments, home_care_services, mltc_plans,
+# MAGIC                       aging_programs, cd_aging_metrics, community_districts
+# MAGIC nyc_transit_finance : transit_agencies, monthly_financials, ridership, cbd_toll_program,
+# MAGIC                       funding_sources, capital_projects, community_districts
+# MAGIC nyc_dep_water       : water_accounts, monthly_billing, rate_schedules, water_main_breaks,
+# MAGIC                       service_requests_311, reservoir_storage, assistance_programs,
+# MAGIC                       infrastructure_assets, community_districts
+# MAGIC nyc_dohmh_food_safety : restaurants, inspections, violations, violation_codes,
+# MAGIC                       rodent_inspections, community_districts
+# MAGIC metric views        : nyc_aging_home_care.client_metrics, nyc_transit_finance.transit_operating_metrics,
+# MAGIC                       nyc_dep_water.water_billing_metrics, nyc_dohmh_food_safety.inspection_metrics
+# MAGIC ```
+# MAGIC All data is **synthetic**.
+
+# COMMAND ----------
+
+for schema in ALL_SCHEMAS:
+    print(f"\n=== {CATALOG}.{schema} ===")
+    display(spark.sql(f"SHOW TABLES IN {CATALOG}.{schema}"))
