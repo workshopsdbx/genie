@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Facilitator guide · NYC Genie Workshop</title>
+<link rel="icon" href="databricks-logo.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body class="subpage">
+<header class="topbar">
+  <a class="brand" href="./" style="text-decoration:none"><img src="databricks-logo.svg" alt="Databricks"><span class="divider"></span><span class="title">NYC Databricks Day</span><span class="pill">Hands-On Genie Workshop</span></a>
+  <div class="top-actions"><a class="btn ghost sm" href="./">Open the workshop guide</a><button class="btn ghost sm" type="button" onclick="window.print()">Print / PDF</button></div>
+</header>
+<main class="single">
+<p class="eyebrow">For facilitators and coaches</p>
+<section id="facilitator">
+  <h2>Facilitator guide</h2>
+  <details class="faq" open><summary>Before the day</summary>
+  <ol>
+    <li><strong>Heads-up:</strong> the registration page says "no setup required", but attendees do need a Free Edition account. Send this page's link with the reminder email and ask them to <strong>create a Free Edition account in advance</strong>. Sign-in uses an emailed code, Google or Microsoft, and some agency networks block one of these.</li>
+    <li>Do a full dry run in a fresh Free Edition account: import, Run all, build a space, open the Curated space. Note anything that has moved in the UI.</li>
+    <li>Have a backup: a pre-built Free Edition workspace you can screen-share if someone's account or network fails.</li>
+  </ol></details>
+  <details class="faq"><summary>What the notebooks do</summary><p>Attendees run <strong>one</strong> dataset notebook (<code>genie_nyc_aging</code>, <code>genie_nyc_transit</code>, <code>genie_nyc_water</code> or <code>genie_nyc_dohmh</code>). They're generated from the all-in-one
+  <a href="genie_byoq_nyc_workshop.py" download><code>genie_byoq_nyc_workshop.py</code></a> by <code>build_domain_notebooks.py</code>; the all-in-one builds all four datasets for a facilitator demo workspace. Each notebook auto-detects the catalog (<code>current_catalog()</code>, usually <code>workspace</code>) and the SQL warehouse. It builds 4 schemas, 29 tables and 4 metric views,
+  creates a Starter space for each of the four domains, and runs every answer-key query as a self-test. <strong>Notebook 2</strong> (<code>genie_byoq_nyc_curated_spaces</code>) creates the four Curated answer-key spaces in about a minute. It's generated from notebook 1's answer key by <code>build_curated_notebook.py</code>, so the two always match. Notebook 1 widgets: <code>genie_spaces</code> (starter / both / curated / none),
+  <code>metadata_level</code> (basic / rich), <code>share_with_group</code> (paid workspaces only). Re-running is safe: same seeds, same numbers, and spaces are updated in place by title.</p></details>
+  <details class="faq"><summary>Demo: "metadata alone" (optional, 10 min)</summary><p>On your own workspace after Round 1, re-run with
+  <code>metadata_level = rich</code> and <code>genie_spaces = none</code>. This rewrites the UC comments with usage rules
+  (e.g. "never SUM arrears across months"). Re-ask the traps in an uncurated space: most now pass with no Genie instructions at all.</p></details>
+  <details class="faq"><summary>Running on a paid workspace instead</summary><p>The same notebook works on any Unity Catalog workspace. Set <code>catalog</code> and <code>warehouse_id</code>, and optionally <code>share_with_group</code> to grant attendees
+  <code>USE / SELECT / CREATE TABLE</code> on the schemas and CAN RUN on the spaces.</p></details>
+  <details class="faq"><summary>Timing tips (matches the registration agenda)</summary><p>Get every laptop through <a href="#setup">setup</a> during arrivals (8:30–9:00). The notebook needs 5–10 minutes, and the 10:00 break is the last safe moment to start it.
+  The 60-minute hands-on lab covers Labs 1–2, Round 1, and the core of Round 2 (instructions + trusted asset). If a table falls behind, skip Lab 2 and go straight from building the space to Round 1.
+  The open lab (11:30–12:15) is self-paced: deeper curation, metric views, benchmarks or BYOQ. Lab 7 is the 12:15 wrap-up talk track.</p></details>
+</section>
+
+<footer><img src="databricks-logo.svg" alt="Databricks"><span><a href="./">Workshop guide</a> · <a href="setup.html">Before you arrive</a></span></footer>
+</main>
+</body>
+</html>

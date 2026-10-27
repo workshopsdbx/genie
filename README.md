@@ -1,6 +1,6 @@
 # Genie BYOQ Workshop: NYC Public Sector
 
-**Workshop site:** https://workshopsdbx.github.io/genie/
+**Workshop site:** https://workshopsdbx.github.io/genie/ · **Send attendees beforehand:** https://workshopsdbx.github.io/genie/setup.html · **Facilitators:** https://workshopsdbx.github.io/genie/facilitator.html
 
 Hands-on Genie workshop for NYC public sector: setup notebooks plus a self-guided HTML instruction site.
 Attendees each use their own **Databricks Free Edition** workspace: import the notebook, Run all, then follow the site.

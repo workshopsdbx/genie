@@ -162,9 +162,8 @@
   const tbody = $("#scorecard tbody");
   $$(".trapcard > .q").forEach((q, i) => {
     const text = q.childNodes[0].textContent.trim();
-    const domain = q.closest(".tab-panel").id.replace("t-", "");
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td><span class="muted small">${esc(domain)}</span> · ${esc(text)}</td>`;
+    tr.innerHTML = `<td><span class="qid-chip">${esc(q.dataset.qid || "")}</span> ${esc(text)}</td>`;
     ["raw", "curated"].forEach((col) => {
       const k = `${i}:${col}`; const td = document.createElement("td"); td.className = "cell";
       td.textContent = score[k] || "";
