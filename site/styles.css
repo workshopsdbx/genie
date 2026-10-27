@@ -298,3 +298,9 @@ table.agenda td:nth-child(2) { white-space: normal; width: 34%; }
 .qlist ol { margin: 0; padding-left: 1.2em; } .qlist ol.ids { list-style: none; padding-left: 0; }
 .qlist li { margin: 6px 0; font-size: .95em; }
 @media (max-width: 1000px) { .tab-panel[data-qlist].active { grid-template-columns: 1fr; } }
+
+/* make dataset tabs obvious */
+.tab-buttons { align-items: center; }
+.tab-label { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--slate); margin-right: 6px; }
+.panel-banner { margin: 14px 0 0; padding: 8px 12px; background: var(--oat-2); border-radius: 6px; font-size: .9em; color: var(--slate); }
+.panel-banner strong { color: var(--navy); }

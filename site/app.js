@@ -63,12 +63,15 @@
       const h = document.createElement("p"); h.className = "phase";
       h.innerHTML = `<span>${esc(label)}</span> ${esc(note)}`; panel.appendChild(h);
     };
+    const banner = document.createElement("p"); banner.className = "panel-banner";
+    banner.innerHTML = `Showing the answer key for <strong>${esc(d.title)}</strong>. Pick a different dataset in the tabs above.`;
+    panel.appendChild(banner);
     phase("Core · Hands-on lab", "Do these two in the 10:15 lab.");
-    section("1 · Text instructions", "Paste into Configure → Text. Then cut anything your agency wouldn't say.");
+    section(`1 · Text instructions for ${d.title}`, "Paste into Configure → Text. Then cut anything your agency wouldn't say.");
     panel.appendChild(codeBlock(d.instructions));
 
     const t = d.trusted;
-    section("2 · Trusted asset (parameterized query)", "Configure → Examples → Add. Use the question as the title and paste the SQL. Each :name becomes a parameter. Click the gear next to it to set its Data type. When Genie answers with this query, the answer is marked Trusted: reviewed, repeatable, and exact.");
+    section(`2 · Trusted asset for ${d.title}`, "Configure → Examples → Add. Use the question as the title and paste the SQL. Each :name becomes a parameter. Click the gear next to it to set its Data type. When Genie answers with this query, the answer is marked Trusted: reviewed, repeatable, and exact.");
     const ti = document.createElement("div"); ti.className = "curate-item";
     const tq = document.createElement("p"); tq.className = "q"; tq.textContent = t.question; ti.appendChild(tq);
     ti.appendChild(codeBlock(withCatalog(t.sql)));
@@ -145,6 +148,8 @@
 
   /* ---------- tabs ---------- */
   $$(".tabs").forEach((tabs) => {
+    const bar = $(".tab-buttons", tabs);
+    if (bar && !$(".tab-label", bar)) { const l = document.createElement("span"); l.className = "tab-label"; l.textContent = "Your dataset:"; bar.prepend(l); }
     const key = "tab:" + tabs.dataset.tabs;
     const activate = (id) => {
       $$(".tab-buttons button", tabs).forEach((b) => b.classList.toggle("active", b.dataset.tab === id));
