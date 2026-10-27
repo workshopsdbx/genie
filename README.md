@@ -1,5 +1,7 @@
 # Genie BYOQ Workshop: NYC Public Sector
 
+**Workshop site:** https://workshopsdbx.github.io/genie-byoq-nyc-workshop/
+
 The NYC rebuild of the Harrisburg PA workshop: a setup notebook plus a self-guided HTML instruction site.
 Attendees each use their own **Databricks Free Edition** workspace: import the notebook, Run all, then follow the site.
 
