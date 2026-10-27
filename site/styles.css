@@ -290,3 +290,11 @@ table.agenda td:nth-child(2) { white-space: normal; width: 34%; }
 .qid-chip.own { background: var(--lava); }
 .your-turn { background: var(--white); border: 1px solid var(--line); border-left: 4px solid var(--lava); border-radius: var(--radius); padding: 4px 18px 8px; margin: 22px 0; }
 .your-turn h3 { margin-top: 14px; }
+
+/* today's questions */
+.tab-panel[data-qlist].active { display: grid; grid-template-columns: 1fr 1.6fr; gap: 16px; }
+.qlist { background: var(--white); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 18px; }
+.qlist h4 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--slate); margin-bottom: 8px; }
+.qlist ol { margin: 0; padding-left: 1.2em; } .qlist ol.ids { list-style: none; padding-left: 0; }
+.qlist li { margin: 6px 0; font-size: .95em; }
+@media (max-width: 1000px) { .tab-panel[data-qlist].active { grid-template-columns: 1fr; } }

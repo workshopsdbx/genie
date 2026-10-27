@@ -129,6 +129,18 @@
       panel.appendChild(it);
     });
   });
+  /* ---------- today's questions (built from the warm-ups and Round 1 cards, so there's one source) ---------- */
+  const WARMUP_COL = { aging: "aging", transit: "transit", water: "water", health: "health" };
+  $$("[data-qlist]").forEach((panel) => {
+    const dom = panel.dataset.qlist;
+    const warm = $$(`#lab2 .qcol.${WARMUP_COL[dom]} .q`).map((q) => q.textContent.trim());
+    const round1 = $$(`#t-${dom} .trapcard > .q`).map((q) => ({ id: q.dataset.qid, text: q.childNodes[0].textContent.trim() }));
+    panel.innerHTML = `
+      <div class="qlist"><h4>Lab 2 · Warm-ups</h4><ol>${warm.map((t) => `<li>${esc(t)}</li>`).join("")}</ol></div>
+      <div class="qlist"><h4>Round 1 · Find where Genie is confidently wrong</h4><ol class="ids">${round1.map((q) =>
+        `<li><span class="qid-chip">${esc(q.id)}</span> ${esc(q.text)}</li>`).join("")}</ol></div>`;
+  });
+
   decorateQuestions();
 
   /* ---------- tabs ---------- */
@@ -316,7 +328,7 @@
   /* ---------- dataset picker (setup) ---------- */
   // Each attendee loads one dataset. Remember it, point the download/import links at its notebook,
   // and open that dataset's tab in every tabbed section of the page.
-  const TAB_PREFIX = { data: "d-", build: "b-", traps: "t-", curate: "c-" };
+  const TAB_PREFIX = { questions: "p-", data: "d-", build: "b-", traps: "t-", curate: "c-" };
   function pickDomain(dom, save) {
     const btn = $(`#domain-picker [data-pick="${dom}"]`);
     if (!btn) return;
